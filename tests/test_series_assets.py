@@ -472,3 +472,164 @@ def test_asset_manifest_director_guard_neutralizes_historical_count_and_legacy_q
     assert "source_requirement_keys" in guarded["effective_instruction"]
     assert any("source_requirement_keys" in criterion for criterion in guarded["acceptance_criteria"])
     assert all("14" not in criterion for criterion in guarded["acceptance_criteria"])
+
+
+def test_asset_manifest_contract_declares_closed_typed_metadata_schema():
+    artifacts = [
+        {
+            "kind": "script",
+            "content": {
+                "asset_requirements": [
+                    {"canonical_id": "CHAR_A", "type": "character"},
+                    {"canonical_id": "LOC_A", "type": "location"},
+                    {"canonical_id": "PROP_A", "type": "prop"},
+                ]
+            },
+        }
+    ]
+    contract = Orchestrator._asset_manifest_contract(artifacts)
+    assert contract["typed_metadata_required_fields"] == {
+        "character": ["appearance", "costume"],
+        "scene": ["key_set_elements"],
+        "prop": ["physical_description", "used_in_scenes"],
+    }
+    assert contract["typed_metadata_policy"].startswith("closed_required_set")
+
+
+def test_asset_manifest_review_guard_suppresses_invented_schema_fields_when_validation_passes():
+    artifact = {
+        "content": {
+            "manifest_validation": {
+                "status": "pass",
+                "typed_metadata_check": {
+                    "status": "pass",
+                    "required_fields": {
+                        "character": ["appearance", "costume"],
+                        "scene": ["key_set_elements"],
+                        "prop": ["physical_description", "used_in_scenes"],
+                    },
+                },
+            }
+        }
+    }
+    review = {
+        "reply": "typed metadata 缺失，需要重生成",
+        "assessment": "schema 不合规",
+        "deviations": [
+            "character 缺 physical_tags/social_register；scene 缺 lighting_mood/spatial_function/architectural_style；prop 缺 material/dimensions_hint/narrative_function。",
+            "manifest_validation 错误地把 typed_metadata_violations 判为空。",
+        ],
+        "suggested_adjustments": ["补齐上述字段"],
+        "recommended_action": "regenerate_current",
+    }
+    directive = {
+        "asset_manifest_contract": {
+            "typed_metadata_required_fields": {
+                "character": ["appearance", "costume"],
+                "scene": ["key_set_elements"],
+                "prop": ["physical_description", "used_in_scenes"],
+            }
+        }
+    }
+    guarded = Orchestrator._guard_asset_manifest_review(review, artifact, directive)
+    assert guarded["deviations"] == []
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["harness_review_guard"]["suppressed_structural_deviations"]
+    assert guarded["harness_review_guard"]["typed_metadata_required_fields"]["prop"] == [
+        "physical_description",
+        "used_in_scenes",
+    ]
+
+
+def test_asset_manifest_review_guard_keeps_semantic_content_deviation():
+    artifact = {"content": {"manifest_validation": {"status": "pass"}}}
+    review = {
+        "deviations": ["用户明确要求保留水晶吊灯，但当前 items 中没有该道具。"],
+        "recommended_action": "regenerate_current",
+    }
+    guarded = Orchestrator._guard_asset_manifest_review(review, artifact, {})
+    assert guarded["deviations"] == review["deviations"]
+    assert guarded["recommended_action"] == "regenerate_current"
+
+
+def test_localized_character_keeps_source_and_production_continuity_separate():
+    artifacts = [{
+        "kind": "asset_manifest",
+        "content": {"items": [{
+            "manifest_id": "mamie-ep02-character-char_grandmere",
+            "asset_type": "character",
+            "canonical_key": "char_grandmere",
+            "decision": "CREATE",
+            "continuity_lock": ["Manteau rouge matelassé à motifs floraux", "same travel bag"],
+        }]},
+    }]
+    content = {"items": [{
+        "manifest_id": "mamie-ep02-character-char_grandmere",
+        "canonical_key": "char_grandmere",
+        "id": "char_grandmere",
+        "name": "Grand-mère",
+        "source_continuity_lock": [
+            "Chinese red floral padded coat with mandarin collar and frog buttons",
+        ],
+        "continuity_lock": [
+            "Deep burgundy quilted French countryside jacket with restrained near-solid textile treatment",
+            "No mandarin collar or East Asian fastening details",
+            "Same large green-grey travel bag",
+        ],
+        "continuity": [
+            "Manteau rouge matelassé à motifs floraux",
+            "Performance: slightly stooped to upright transition",
+        ],
+        "localized_visual_design": {
+            "outerwear": "Deep burgundy quilted French countryside jacket",
+        },
+        "generation_prompt_en": "French rural elderly woman in a deep burgundy quilted countryside jacket.",
+    }]}
+
+    enforced = Orchestrator._enforce_asset_manifest(
+        "characters", content, artifacts,
+        workspace={"settings": {"target_market": "France", "target_language": "fr-FR"}},
+    )
+    item = enforced["items"][0]
+    assert item["source_continuity_lock"] == [
+        "Chinese red floral padded coat with mandarin collar and frog buttons"
+    ]
+    assert item["continuity_lock"] == [
+        "Deep burgundy quilted French countryside jacket with restrained near-solid textile treatment",
+        "No mandarin collar or East Asian fastening details",
+        "Same large green-grey travel bag",
+    ]
+    assert item["production_continuity_lock"] == item["continuity_lock"]
+    assert item["continuity"] == item["continuity_lock"]
+    assert enforced["continuity_localization_validation"]["status"] == "pass"
+
+
+def test_localized_asset_never_falls_back_to_source_lock_when_production_lock_missing():
+    artifacts = [{
+        "kind": "asset_manifest",
+        "content": {"items": [{
+            "manifest_id": "CHAR_001",
+            "asset_type": "character",
+            "canonical_key": "char_mamie",
+            "decision": "CREATE",
+            "continuity_lock": ["source floral coat"],
+        }]},
+    }]
+    content = {"items": [{
+        "manifest_id": "CHAR_001",
+        "canonical_key": "char_mamie",
+        "id": "char_mamie",
+        "source_continuity_lock": ["source floral coat"],
+        "localized_visual_design": {"wardrobe": "French countryside coat"},
+        "generation_prompt_en": "French countryside elderly woman",
+    }]}
+    enforced = Orchestrator._enforce_asset_manifest("characters", content, artifacts)
+    item = enforced["items"][0]
+    assert item["source_continuity_lock"] == ["source floral coat"]
+    assert item["continuity_lock"] == []
+    assert item["production_continuity_lock"] == []
+    assert enforced["continuity_localization_validation"]["status"] == "fail"
+    assert enforced["continuity_localization_validation"]["issues"] == [{
+        "canonical_key": "char_mamie",
+        "issue": "missing_production_continuity_lock",
+    }]

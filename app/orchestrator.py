@@ -177,6 +177,11 @@ class Orchestrator:
                 24,
                 "总管已生成执行指令" + (f"：{summary[:100]}" if summary else ""),
             )
+        artifact_revisions = {str(item.get("kind") or ""): int(item.get("revision") or 0) for item in artifacts}
+        selected_candidates = [
+            candidate for candidate in self.db.list_asset_candidates(workspace_id, selected_only=True)
+            if int(candidate.get("artifact_revision") or 0) == artifact_revisions.get(str(candidate.get("stage") or ""), -1)
+        ]
         runtime_context = {
             "workspace": workspace,
             "artifacts": artifacts,
@@ -185,6 +190,7 @@ class Orchestrator:
             "user_instruction": user_instruction,
             "execution_directive": execution_directive,
             "asset_library_context": self.db.workspace_asset_context(workspace_id),
+            "asset_candidates": selected_candidates,
             "series": self.db.get_series(str((workspace.get("settings") or {}).get("series_id") or "")) if (workspace.get("settings") or {}).get("series_id") else None,
         }
         content = provider.generate(stage, runtime_context)
@@ -196,7 +202,7 @@ class Orchestrator:
                 previous_manifest=(by_kind.get("asset_manifest") or {}).get("content", {}),
             )
         elif stage in {"characters", "scenes", "props"}:
-            content = self._enforce_asset_manifest(stage, content, artifacts)
+            content = self._enforce_asset_manifest(stage, content, artifacts, workspace=workspace)
         if progress_callback:
             progress_callback(94, "生成完成，正在保存产物")
         agent = agent_for_stage(stage)
@@ -486,6 +492,12 @@ class Orchestrator:
             "canonical_asset_types": ["character", "scene", "prop"],
             "identity_policy": "script keys bind through source_requirement_keys; manifest canonical_key is a separate stable production identity",
             "continuity_lock_encoding": "array_of_rules",
+            "typed_metadata_required_fields": {
+                "character": ["appearance", "costume"],
+                "scene": ["key_set_elements"],
+                "prop": ["physical_description", "used_in_scenes"],
+            },
+            "typed_metadata_policy": "closed_required_set; other descriptive fields are optional unless the user explicitly binds them",
             "count_policy": "evidence_derived_not_quota",
         }
 
@@ -551,8 +563,8 @@ class Orchestrator:
             + "- Preserve genuinely supported extra reusable scenes/props, reconcile semantic aliases, and do not invent assets just to hit a number.\n"
             + "- Final item count is evidence-derived. No historical total (including 10/12/14 or a 5/5/4 shape) is a binding acceptance criterion.\n"
             + "- continuity_lock canonical encoding is an array of immutable rule strings; historical boolean true/false means locked/unlocked intent only and must never be used as the output data type.\n"
-            + "- Typed metadata is explicit: character has appearance + costume, scene has key_set_elements, prop has physical_description + used_in_scenes.\n"
-            + "- Validation is structural: no missing source requirements, no duplicate canonical/semantic assets, canonical types only, valid library references, required continuity locks preserved, and typed metadata fields present.\n"
+            + "- Typed metadata has a CLOSED required field set: character = appearance + costume; scene = key_set_elements; prop = physical_description + used_in_scenes. Other descriptive fields (for example physical_tags/social_register/lighting_mood/spatial_function/architectural_style/material/dimensions_hint/narrative_function) are optional unless the latest user instruction explicitly names them.\n"
+            + "- Validation is structural: no missing source requirements, no duplicate canonical/semantic assets, canonical types only, valid library references, required continuity locks preserved, and the closed required typed-metadata fields are explicitly present with the expected container type.\n"
             + f"- Current screenplay baseline: {json.dumps(contract, ensure_ascii=False)}"
         )
 
@@ -574,7 +586,7 @@ class Orchestrator:
             "All output asset_type values use only character, scene, or prop; wardrobe is character metadata and set/location is scene.",
             "Manifest canonical_key values are stable normalized production identities, with no duplicate canonical or semantic assets after reconciliation.",
             "continuity_lock uses the canonical array-of-rules encoding; required lock intent and valid REUSE/VARIANT/CREATE library-reference semantics are preserved.",
-            "Typed metadata is explicit: character appearance/costume, scene key_set_elements, prop physical_description/used_in_scenes.",
+            "Typed metadata uses the closed required set only: character appearance/costume, scene key_set_elements, prop physical_description/used_in_scenes; no extra schema field is required unless explicitly bound by the user.",
             "Evidence-supported additional reusable scenes/props may remain; final item count is evidence-derived and is not an exact-count quota.",
         ]
         guarded["acceptance_criteria"] = criteria
@@ -792,6 +804,7 @@ class Orchestrator:
         downstream = self.downstream_stages(stage, include_self=False)
         self.db.mark_artifacts_stale(workspace_id, [stage])
         removed = self.db.delete_artifacts(workspace_id, downstream)
+        removed_candidates = self.db.delete_asset_candidates_for_stages(workspace_id, downstream)
         removed_jobs = self.db.clear_terminal_jobs_for_stages(workspace_id, downstream)
         affected = [stage, *downstream]
         self.db.clear_stage_guidance_plans(workspace_id, affected)
@@ -825,6 +838,7 @@ class Orchestrator:
             "previous_revision": current.get("revision"),
             "downstream_cleared": removed,
             "removed_jobs": removed_jobs,
+            "removed_visual_candidates": len(removed_candidates),
             "reset_gates": reset_gates,
             "memory_preserved": True,
             "conversation_preserved": True,
@@ -882,6 +896,7 @@ class Orchestrator:
                 f"{STAGE_LABELS.get(str(job.get('stage')), job.get('stage'))}仍在运行，不能清理该区域"
             )
         removed = self.db.delete_artifacts(workspace_id, affected)
+        removed_candidates = self.db.delete_asset_candidates_for_stages(workspace_id, affected)
         removed_jobs = self.db.clear_terminal_jobs_for_stages(workspace_id, affected)
         self.db.clear_stage_guidance_plans(workspace_id, affected)
         self.db.clear_stage_reviews(workspace_id, affected)
@@ -918,9 +933,88 @@ class Orchestrator:
             "affected": affected,
             "removed_artifacts": removed,
             "removed_jobs": removed_jobs,
+            "removed_visual_candidates": len(removed_candidates),
             "reset_gates": reset_gates,
             "preserved_upstream": [item for item in STAGES if item not in affected],
         }
+
+    @staticmethod
+    def _guard_asset_manifest_review(
+        review: dict[str, Any],
+        artifact: dict[str, Any],
+        execution_directive: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Keep LLM review subordinate to deterministic Asset Manifest validation.
+
+        Kimi may still review semantic/content-specific requirements (for example a
+        chandelier explicitly requested by the user), but it must not invent a
+        second schema after the harness validator has passed.  Structural claims
+        about keys, taxonomy, lock encoding, or typed metadata are owned by
+        ``manifest_validation``.
+        """
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else None
+        validation = content.get("manifest_validation") if isinstance(content, dict) else None
+        if not isinstance(validation, dict) or str(validation.get("status") or "").lower() != "pass":
+            return guarded
+
+        structural_markers = (
+            "schema", "字段", "结构化元数据", "typed metadata", "typed_metadata",
+            "canonical_key", "source_requirement", "continuity_lock",
+            "manifest_validation", "asset_type", "taxonomy", "数据类型",
+            "命名规范", "非法类型", "illegal_asset_type", "duplicate_canonical",
+            "required_baseline_coverage", "physical_tags", "social_register",
+            "lighting_mood", "spatial_function", "architectural_style",
+            "dimensions_hint", "narrative_function",
+        )
+
+        deviations = guarded.get("deviations")
+        if not isinstance(deviations, list):
+            deviations = []
+        kept: list[Any] = []
+        suppressed: list[Any] = []
+        for deviation in deviations:
+            try:
+                blob = json.dumps(deviation, ensure_ascii=False).casefold()
+            except TypeError:
+                blob = str(deviation).casefold()
+            if any(marker.casefold() in blob for marker in structural_markers):
+                suppressed.append(deviation)
+            else:
+                kept.append(deviation)
+        guarded["deviations"] = kept
+
+        # If deterministic validation passed, an LLM-only structural complaint may
+        # not force a regeneration loop.  Semantic/content deviations remain free
+        # to do so.
+        if suppressed and not kept:
+            guarded["recommended_action"] = "proceed"
+            guarded["assessment"] = (
+                "Harness deterministic Asset Manifest validation passed. "
+                "The reviewer's schema-only deviations were suppressed because they "
+                "contradict the harness-owned contract."
+            )
+            guarded["reply"] = (
+                "Asset Manifest 已通过 Harness 的确定性结构校验；本轮总管提出的额外字段要求不属于绑定 schema，"
+                "因此不会触发重复重生成。可以继续检查资产内容并进入下一阶段。"
+            )
+            guarded["suggested_adjustments"] = []
+
+        guarded["harness_review_guard"] = {
+            "manifest_validation_status": "pass",
+            "structural_authority": "artifact.content.manifest_validation",
+            "suppressed_structural_deviations": suppressed,
+            "remaining_semantic_deviations": kept,
+            "typed_metadata_required_fields": (execution_directive.get("asset_manifest_contract") or {}).get(
+                "typed_metadata_required_fields",
+                {
+                    "character": ["appearance", "costume"],
+                    "scene": ["key_set_elements"],
+                    "prop": ["physical_description", "used_in_scenes"],
+                },
+            ),
+        }
+        return guarded
 
     def _post_generation_review(
         self,
@@ -953,6 +1047,8 @@ class Orchestrator:
                     review = candidate
             except Exception as exc:
                 review = {"warning": str(exc)}
+        if stage == "asset_manifest" and review:
+            review = self._guard_asset_manifest_review(review, artifact, execution_directive)
         reply = str(review.get("reply") or "").strip()
         if not reply:
             next_actions = context["next_actions"]
@@ -1569,16 +1665,30 @@ class Orchestrator:
             if len(set(keys)) > 1
         ]
 
+        typed_metadata_required_fields = {
+            "character": ["appearance", "costume"],
+            "scene": ["key_set_elements"],
+            "prop": ["physical_description", "used_in_scenes"],
+        }
+
+        def metadata_field_valid(field: str, item: dict[str, Any]) -> bool:
+            if field not in item:
+                return False
+            value = item.get(field)
+            if field in {"key_set_elements", "used_in_scenes"}:
+                return isinstance(value, list)
+            return isinstance(value, str)
+
+        typed_metadata_missing_fields: dict[str, list[str]] = {}
         typed_metadata_violations: list[str] = []
         for item in reconciled:
             key = item_key(item)
             asset_type = str(item.get("asset_type") or "")
-            if asset_type == "character" and not {"appearance", "costume"}.issubset(item):
+            required_fields = typed_metadata_required_fields.get(asset_type, [])
+            missing_fields = [field for field in required_fields if not metadata_field_valid(field, item)]
+            if missing_fields:
                 typed_metadata_violations.append(key)
-            elif asset_type == "scene" and "key_set_elements" not in item:
-                typed_metadata_violations.append(key)
-            elif asset_type == "prop" and not {"physical_description", "used_in_scenes"}.issubset(item):
-                typed_metadata_violations.append(key)
+                typed_metadata_missing_fields[key] = missing_fields
 
         validation_pass = not (
             missing_baseline
@@ -1630,7 +1740,10 @@ class Orchestrator:
             },
             "typed_metadata_check": {
                 "status": "pass" if not typed_metadata_violations else "fail",
+                "required_fields": typed_metadata_required_fields,
+                "policy": "closed_required_set_explicit_types",
                 "violations": typed_metadata_violations,
+                "missing_fields_by_asset": typed_metadata_missing_fields,
             },
             "asset_type_counts": type_counts,
             "extra_count": max(0, len(reconciled) - len(baseline_source_keys)),
@@ -1644,7 +1757,7 @@ class Orchestrator:
         return result
 
     @staticmethod
-    def _enforce_asset_manifest(stage: str, content: dict[str, Any], artifacts: list[dict[str, Any]]) -> dict[str, Any]:
+    def _enforce_asset_manifest(stage: str, content: dict[str, Any], artifacts: list[dict[str, Any]], *, workspace: dict[str, Any] | None = None) -> dict[str, Any]:
         type_map={"characters":"character","scenes":"scene","props":"prop"}
         wanted_type=type_map[stage]
         manifest_artifact=next((a for a in artifacts if a.get("kind")=="asset_manifest"), None)
@@ -1658,6 +1771,7 @@ class Orchestrator:
         by_key={str(item.get("canonical_key") or ""):item for item in output if item.get("canonical_key")}
         enforced=[]
         missing=[]
+        continuity_localization_issues: list[dict[str, Any]] = []
         for manifest in manifest_items:
             manifest_id=str(manifest.get("manifest_id") or "")
             canonical_key=str(manifest.get("canonical_key") or manifest_id)
@@ -1670,9 +1784,93 @@ class Orchestrator:
             item["canonical_key"]=canonical_key
             item["reuse_decision"]=decision
             item["library_asset_id"] = manifest.get("library_asset_id") if decision in {"REUSE","VARIANT"} else None
-            item["continuity_lock"] = manifest.get("continuity_lock") or item.get("continuity_lock") or []
+            # Source continuity and production continuity are intentionally separate.
+            # The manifest lock is source/narrative evidence; once an asset designer has
+            # produced an explicit localized design, NEVER copy that source lock back over
+            # the designer's French/target-market production continuity.
+            def rule_list(value: Any) -> list[str]:
+                if isinstance(value, (list, tuple, set)):
+                    raw_values = value
+                elif value in (None, "", False):
+                    raw_values = []
+                else:
+                    raw_values = [value]
+                output_rules: list[str] = []
+                for raw_value in raw_values:
+                    rule = str(raw_value).strip()
+                    if rule and rule not in output_rules:
+                        output_rules.append(rule)
+                return output_rules
+
+            explicit_source_lock = rule_list(item.get("source_continuity_lock"))
+            manifest_source_lock = rule_list(manifest.get("continuity_lock"))
+            # Prefer an explicit source archive returned by the designer.  It can contain
+            # source-culture facts that the higher-level manifest intentionally abstracts.
+            source_lock = explicit_source_lock or manifest_source_lock
+
+            production_lock = rule_list(item.get("production_continuity_lock"))
+            if not production_lock:
+                production_lock = rule_list(item.get("continuity_lock"))
+
+            has_localized_design = bool(
+                item.get("localized_visual_design")
+                or item.get("generation_prompt_en")
+                or item.get("visual_localization_notes")
+            )
+            # Backward compatibility for old/non-localized outputs only.  For an explicitly
+            # localized asset, an absent production lock is safer left empty (and reviewable)
+            # than silently contaminated by source-culture styling.
+            if not production_lock and not has_localized_design:
+                production_lock = list(manifest_source_lock)
+
+            item["source_continuity_lock"] = source_lock
+            item["continuity_lock"] = production_lock
+            item["production_continuity_lock"] = list(production_lock)
+            if has_localized_design:
+                # continuity is a legacy/general-purpose alias used by some downstream
+                # retrieval paths.  Once localization exists, keep it aligned to production
+                # continuity so stale source styling cannot leak through a third field.
+                item["continuity"] = list(production_lock)
             item["variant_key"] = item.get("variant_key") or (str(manifest.get("variant_key") or "") if decision=="VARIANT" else "")
             item["manifest_reason"] = manifest.get("reason") or ""
+
+            settings = (workspace or {}).get("settings") or {}
+            target_market = str(settings.get("target_market") or "").strip()
+            target_language = str(settings.get("target_language") or "").strip()
+            source_traits = item.get("source_visual_traits")
+            if not isinstance(source_traits, list) or not source_traits:
+                source_candidates: list[str] = []
+                for field in (
+                    ("appearance", "wardrobe") if stage == "characters"
+                    else ("location", "layout", "lighting") if stage == "scenes"
+                    else ("description", "material_scale", "state")
+                ):
+                    value = item.get(field)
+                    if isinstance(value, str) and value.strip():
+                        source_candidates.append(value.strip())
+                source_traits = source_candidates[:4]
+            item["source_visual_traits"] = source_traits
+            item.setdefault("localized_visual_design", "")
+            item.setdefault("visual_localization_notes", "")
+            item.setdefault("generation_prompt_en", "")
+            item["visual_localization"] = {
+                "target_market": target_market,
+                "target_language": target_language,
+                "source_vs_production_policy": "source traits preserve narrative function; culturally specific styling is adapted to the target market before rendering",
+                "provider_prompt_language": "en",
+                "status": "localized_spec_ready" if item.get("localized_visual_design") and item.get("generation_prompt_en") else "provider_compiler_fallback",
+            }
+            if item.get("localized_visual_design") or item.get("generation_prompt_en"):
+                if not item.get("continuity_lock"):
+                    continuity_localization_issues.append({
+                        "canonical_key": canonical_key,
+                        "issue": "missing_production_continuity_lock",
+                    })
+                elif item.get("source_continuity_lock") and item.get("source_continuity_lock") == item.get("continuity_lock"):
+                    continuity_localization_issues.append({
+                        "canonical_key": canonical_key,
+                        "issue": "source_and_production_continuity_are_identical",
+                    })
             enforced.append(item)
         if missing:
             raise OrchestrationError(
@@ -1680,6 +1878,11 @@ class Orchestrator:
             )
         result["items"]=enforced
         result["manifest_enforced"] = True
+        result["continuity_localization_validation"] = {
+            "status": "pass" if not continuity_localization_issues else "fail",
+            "policy": "source_continuity_lock_is_archive; continuity_lock_is_target_market_production_authority; never auto-merge source into production",
+            "issues": continuity_localization_issues,
+        }
         return result
 
     def publish_series_assets(self, workspace_id: str) -> dict[str, Any]:

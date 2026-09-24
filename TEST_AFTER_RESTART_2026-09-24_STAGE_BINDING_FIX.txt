@@ -1,0 +1,10 @@
+1. 覆盖本增量包并完全退出/重启 Harness。
+2. 浏览器刷新项目；本包已更换静态资源版本号，正常刷新即可。如浏览器仍显示旧文字，可 Ctrl+F5 一次。
+3. 打开 Mamie 归家 · EP02，不清理角色，不重跑 Asset Manifest。
+4. 保持 characters rev1 现状。
+5. 在制作对话流底部确认标题应显示：当前评审节点：角色 · 角色设计师。
+6. 黄色按钮应显示：反馈并重生成角色（而不是“反馈并重生成当前节点”）。
+7. 保留之前的视觉本地化反馈，点击黄色按钮。
+8. 应看到新的 characters job queued/running，并最终生成 characters rev2；不应创建 scenes job。
+9. 生成成功后 Director Chat 仍应停留在角色节点，可继续针对角色 rev2 反馈。
+10. 只有点击紫色“生成场景”时，Director Chat/总管计划才切换到 scenes。

@@ -14,6 +14,8 @@ const state = {
   streamRefreshBusy: false,
   chatStageOverride: "",
   pendingChat: null,
+  candidateBases: {},
+  batchSelections: {},
 };
 
 let jobWatchTimer = null;
@@ -237,6 +239,7 @@ function renderArtifacts(artifacts) {
   root.innerHTML = visible.map(artifactCard).join("");
   bindStageResetButtons();
   bindArtifactFeedbackButtons();
+  bindAssetCandidateUi();
 }
 
 function renderAgentContracts() {
@@ -258,12 +261,22 @@ function renderAgentContracts() {
 function artifactCard(a) {
   const agentId = a.content?._agent?.id || state.meta.stage_agents?.[a.kind];
   const agent = (state.meta.agents || []).find(item => item.id === agentId);
+  const reviewRow = state.detail?.stage_reviews?.[a.kind];
+  const currentReview = reviewRow && Number(reviewRow.artifact_revision || 0) === Number(a.revision || 0) ? (reviewRow.review || {}) : null;
+  const reviewAction = String(currentReview?.recommended_action || "");
+  const reviewBadge = reviewAction === "proceed"
+    ? `<span class="pill ready review-status-pill" title="总管复盘已通过。右侧二次确认如仍显示 pending，表示等待人工确认，不代表总管拒绝。">总管已通过</span>`
+    : (["regenerate_current", "wait_for_user"].includes(reviewAction)
+      ? `<span class="pill stale review-status-pill" title="总管复盘认为当前 revision 仍需处理。">总管待修</span>`
+      : "");
+  const visualStageClass = ["characters", "scenes", "props"].includes(a.kind) ? " asset-workbench-card" : "";
   return `
-    <article class="artifact-card ${a.status}">
+    <article class="artifact-card ${a.status}${visualStageClass}">
       <div class="artifact-card-header">
         <div><strong>${escapeHtml(a.name)}</strong><div class="artifact-meta">${escapeHtml(agent?.name || "未分配 Agent")} · rev ${a.revision} · ${escapeHtml(a.provider)}</div></div>
         <div class="artifact-header-actions">
           <span class="pill ${a.status}">${escapeHtml(a.status)}</span>
+          ${reviewBadge}
           ${a.kind !== "source" ? `<button class="mini-button" data-feedback-stage="${escapeHtml(a.kind)}">在对话流中调整</button><button class="mini-button reject stage-reset-button" data-reset-stage="${escapeHtml(a.kind)}">清理此节点</button>` : ""}
         </div>
       </div>
@@ -297,6 +310,10 @@ function activityEventText(item) {
   if (type === "workspace.created") return `工作区已创建：${p.title || ""}`;
   if (type === "memory.updated") return "项目长期记忆已更新";
   if (type === "stage.regeneration_requested") return `${state.meta.labels[p.stage] || p.stage} 收到修改意见 · 将基于 rev ${p.previous_revision || "?"} 重新生成，并使下游失效`;
+  if (type === "asset_candidate.generated") return `${state.meta.labels[p.stage] || p.stage} · ${p.canonical_key || "资产"} 新增 ${p.count || 1} 张视觉候选${p.has_feedback ? " · 已应用局部调整要求" : ""}`;
+  if (type === "asset_candidate.batch_generated") return `${state.meta.labels[p.stage] || p.stage} · 已为 ${p.asset_count || 0} 项资产批量生成视觉候选（每项 ${p.count_per_asset || 1} 张）${p.has_feedback ? " · 已应用统一要求" : ""}`;
+  if (type === "asset_candidate.selected") return `${state.meta.labels[p.stage] || p.stage} · ${p.canonical_key || "资产"} 已选定视觉候选，并使相关下游结果失效`;
+  if (type === "asset_candidate.deleted") return `${state.meta.labels[p.stage] || p.stage} · ${p.canonical_key || "资产"} 删除了一张视觉候选`;
   return `${type} · ${JSON.stringify(p)}`;
 }
 
@@ -376,6 +393,7 @@ function renderContent(content, kind) {
   if (kind === "source") return renderSource(content);
   if (kind === "script") return renderScript(content);
   if (kind === "asset_manifest") return renderAssetManifest(content);
+  if (["characters", "scenes", "props"].includes(kind)) return renderAssetDesignWorkbench(content, kind);
   if (kind === "analysis" && Array.isArray(content?.source_media)) {
     const allFrames = content.source_media.flatMap(media => (media.frames || []).map(frame => ({...frame, media_name: media.name})));
     const previewLimit = 80;
@@ -427,6 +445,268 @@ function renderAssetManifest(content) {
     const sourceKeys = Array.isArray(item.source_requirement_keys) ? item.source_requirement_keys : [];
     return `<div class="artifact-item"><div class="asset-card-actions"><b>${escapeHtml(item.manifest_id || item.canonical_key || "asset")}</b><span class="asset-manifest-decision">${escapeHtml(item.decision || "CREATE")}</span></div><div>${escapeHtml(item.script_identity || item.canonical_key || "")}</div><div class="artifact-meta">${escapeHtml(item.asset_type || "")} · ${escapeHtml(item.canonical_key || "")}${item.library_asset_id ? ` · library: ${escapeHtml(item.library_asset_id)}` : " · 将自动生成"}</div>${sourceKeys.length ? `<div class="artifact-meta">script binding: ${escapeHtml(sourceKeys.join(" · "))}</div>` : ""}<div class="artifact-meta">${escapeHtml(item.reason || "")}</div>${Array.isArray(item.variant_requirements) && item.variant_requirements.length ? `<div class="artifact-meta">Variant: ${escapeHtml(item.variant_requirements.join("；"))}</div>` : ""}</div>`;
   }).join("")}</div>`;
+}
+
+function assetStageLabel(kind) {
+  return {characters: "角色", scenes: "场景", props: "道具"}[kind] || kind;
+}
+
+function assetValue(value) {
+  if (value === null || value === undefined || value === "") return "";
+  if (Array.isArray(value)) return value.map(x => typeof x === "object" ? JSON.stringify(x) : String(x)).join("；");
+  if (typeof value === "object") return Object.entries(value).map(([k,v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : v}`).join("；");
+  return String(value);
+}
+
+function assetSpecRows(item, kind) {
+  const rows = [];
+  const add = (label, value) => { const text = assetValue(value); if (text) rows.push([label, text]); };
+  if (kind === "characters") {
+    add("外观", item.appearance || item.description);
+    add("服装", item.wardrobe || item.costume);
+    add("表演", item.performance);
+    add("声音", item.voice);
+    add("成片连续性锁", item.production_continuity_lock || item.continuity_lock);
+    add("扩展连续性备注", item.continuity);
+  } else if (kind === "scenes") {
+    add("地点", item.location || item.description);
+    add("布局", item.layout || item.key_set_elements);
+    add("灯光", item.lighting);
+    add("时间/天气", item.time_weather);
+    add("成片连续性锁", item.production_continuity_lock || item.continuity_lock);
+    add("扩展连续性备注", item.continuity);
+  } else {
+    add("描述", item.description || item.physical_description);
+    add("材质/尺度", item.material_scale || item.material);
+    add("状态", item.state);
+    add("使用场次", item.used_in || item.used_in_scenes);
+    add("成片连续性锁", item.production_continuity_lock || item.continuity_lock);
+    add("扩展连续性备注", item.continuity);
+  }
+  add("源素材连续性（仅归档）", item.source_continuity_lock);
+  add("源视觉锚点", item.source_visual_traits);
+  add("法国化/目标市场生产设计", item.localized_visual_design);
+  add("视觉本地化说明", item.visual_localization_notes);
+  add("图片/视频 Prompt (EN)", item.generation_prompt_en);
+  return rows;
+}
+
+function currentArtifactForStage(kind) {
+  return (state.detail?.artifacts || []).find(a => a.kind === kind) || null;
+}
+
+function currentCandidatesForAsset(kind, canonicalKey) {
+  const artifact = currentArtifactForStage(kind);
+  const revision = Number(artifact?.revision || 0);
+  return (state.detail?.asset_candidates || [])
+    .filter(c => c.stage === kind && c.canonical_key === canonicalKey && Number(c.artifact_revision || 0) === revision)
+    .sort((a,b) => String(a.created_at || "").localeCompare(String(b.created_at || "")));
+}
+
+function batchSelectionKey(kind, canonicalKey) {
+  return `${kind}:${canonicalKey}`;
+}
+
+function isBatchSelected(kind, canonicalKey) {
+  return Boolean(state.batchSelections[batchSelectionKey(kind, canonicalKey)]);
+}
+
+function setBatchSelected(kind, canonicalKey, selected) {
+  const key = batchSelectionKey(kind, canonicalKey);
+  if (selected) state.batchSelections[key] = true;
+  else delete state.batchSelections[key];
+}
+
+function selectedBatchKeys(kind) {
+  const prefix = `${kind}:`;
+  return Object.keys(state.batchSelections)
+    .filter(key => key.startsWith(prefix) && state.batchSelections[key])
+    .map(key => key.slice(prefix.length));
+}
+
+function renderAssetCandidate(candidate, baseCandidateId) {
+  const isSelected = Boolean(candidate.selected);
+  const isBase = candidate.id === baseCandidateId;
+  const feedback = String(candidate.feedback || "").trim();
+  return `<div class="visual-candidate ${isSelected ? "selected" : ""} ${isBase ? "edit-base" : ""}" data-candidate-card="${escapeHtml(candidate.id)}">
+    <a class="visual-candidate-image" href="${escapeHtml(candidate.url || "#")}" target="_blank" rel="noopener">${renderMedia(candidate.url)}</a>
+    <div class="visual-candidate-meta"><span>${escapeHtml(candidate.model || "Seedream")}</span>${isSelected ? `<span class="pill ready">采用中</span>` : ""}${isBase ? `<span class="pill">调整基准</span>` : ""}</div>
+    ${feedback ? `<div class="artifact-meta candidate-feedback-note">本次要求：${escapeHtml(feedback)}</div>` : ""}
+    <div class="visual-candidate-actions">
+      ${isSelected ? "" : `<button class="mini-button ok" data-select-candidate="${escapeHtml(candidate.id)}">设为采用并锁定</button>`}
+      <button class="mini-button" data-base-candidate="${escapeHtml(candidate.id)}">基于这张调整</button>
+      ${isSelected ? "" : `<button class="mini-button reject" data-delete-candidate="${escapeHtml(candidate.id)}">删除</button>`}
+    </div>
+  </div>`;
+}
+
+function renderAssetDesignWorkbench(content, kind) {
+  const items = Array.isArray(content?.items) ? content.items : [];
+  const label = assetStageLabel(kind);
+  const artifact = currentArtifactForStage(kind);
+  const revision = Number(artifact?.revision || 0);
+  const withCandidate = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).length).length;
+  const selectedCount = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).some(c => c.selected)).length;
+  const cards = items.map((item, idx) => {
+    const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
+    const candidates = currentCandidatesForAsset(kind, canonicalKey);
+    const selected = candidates.find(c => c.selected);
+    const rememberedBase = state.candidateBases[`${kind}:${canonicalKey}`] || "";
+    const latest = candidates[candidates.length - 1];
+    const baseCandidateId = rememberedBase || selected?.id || latest?.id || "";
+    const rows = assetSpecRows(item, kind);
+    const candidateHtml = candidates.length
+      ? candidates.map(c => renderAssetCandidate(c, baseCandidateId)).join("")
+      : `<div class="candidate-empty">还没有视觉候选。先“抽 1 张”，满意后点“设为采用”；不满意就写局部要求再抽。</div>`;
+    const batchSelected = isBatchSelected(kind, canonicalKey);
+    return `<section class="asset-design-card ${batchSelected ? "batch-selected" : ""}" data-asset-stage="${escapeHtml(kind)}" data-canonical-key="${escapeHtml(canonicalKey)}">
+      <div class="asset-design-header">
+        <div class="asset-design-title-wrap"><label class="batch-select-box"><input type="checkbox" data-batch-select ${batchSelected ? "checked" : ""}><span>加入批量</span></label><div><b>${escapeHtml(item.name || item.id || canonicalKey)}</b><div class="artifact-meta">${escapeHtml(canonicalKey)} · ${escapeHtml(item.reuse_decision || item.decision || "CREATE")}</div></div></div>
+        ${selected ? `<span class="pill ready">已锁定视觉</span>` : `<span class="pill">待选视觉</span>`}
+      </div>
+      <div class="visual-localization-banner"><b>视觉本地化</b><span>目标市场：${escapeHtml(item?.visual_localization?.target_market || state.detail?.workspace?.settings?.target_market || "未设置")}</span><span>Provider Prompt：English</span><span>${item.localized_visual_design && item.generation_prompt_en ? "显式本地化设计已就绪" : "当前旧产物缺少显式本地化字段；抽图时仍会由 Harness Prompt Compiler 强制做目标市场适配，建议本轮重新生成该设计节点后再正式锁图"}</span></div>
+      <div class="asset-spec-grid">${rows.map(([k,v]) => `<div class="asset-spec-row"><strong>${escapeHtml(k)}</strong><span>${escapeHtml(v)}</span></div>`).join("")}</div>
+      <div class="candidate-gallery">${candidateHtml}</div>
+      <div class="candidate-editor">
+        <textarea rows="2" data-candidate-feedback placeholder="只改这个${escapeHtml(label)}。例如：${kind === "characters" ? "脸更接近原片、年龄感更明显；保留人物身份和酒红色识别色，但服装改成可信的法国乡村绗缝外套，不要中国式大红花棉袄" : kind === "scenes" ? "门厅更窄、吊灯更大、保留现有布局和法式豪宅质感" : "旅行袋更旧、更大；保持绿灰帆布和束带结构不变"}"></textarea>
+        <div class="candidate-editor-actions"><span class="artifact-meta">${baseCandidateId ? "默认基于当前采用/最近候选做图生图调整" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button></div>
+      </div>
+    </section>`;
+  }).join("");
+  const batchSelectedKeys = selectedBatchKeys(kind);
+  return `<div class="asset-visual-workbench">
+    <div class="visual-workbench-toolbar"><div><strong>${escapeHtml(label)}视觉候选工作台</strong><div class="artifact-meta">rev ${revision} · ${items.length} 项 · ${withCandidate} 项已有候选 · ${selectedCount} 项已采用。视觉抽卡只改图片，不重跑 Kimi ${escapeHtml(label)}圣经。</div></div><button class="mini-button" data-generate-missing-assets>为全部未出图资产各抽 1 张</button></div>
+    <div class="visual-workbench-note">源片视觉事实 ≠ 成片视觉锁。Harness 会先按目标市场做视觉本地化，再调用图片 Provider；Provider 视觉 Prompt 默认使用英文，法语对白/可见文字仍保持目标语言。候选图不会自动进入下游；满意后点“设为采用并锁定”，后续「参考图」优先使用该图。</div>
+    <div class="batch-workbench-panel" data-batch-workbench="${escapeHtml(kind)}">
+      <div class="batch-workbench-header"><div><strong>批量要求与抽图</strong><div class="artifact-meta">对勾选的${escapeHtml(label)}一次性应用同一条要求，例如“全部进一步法国化、保持各自身份与既有分析”。模型仍会结合每个资产自己的 Bible / 本地化分析分别出图。</div></div><div class="batch-workbench-toolbar"><button class="mini-button" data-batch-select-all>全选</button><button class="mini-button" data-batch-clear>清空勾选</button><span class="pill amber" data-batch-count>${batchSelectedKeys.length} 项已勾选</span></div></div>
+      <textarea data-batch-feedback placeholder="给一批${escapeHtml(label)}同样的要求。例如：全部进一步法国化，保留各自年龄、阶层、叙事功能与主要识别色；服装更贴合可信法国环境，不要保留中国特定造型元素。"></textarea>
+      <div class="batch-workbench-actions"><span class="artifact-meta">橘色按钮 = 对当前勾选项批量抽图。若某项已有采用图，会默认基于该图继续调整；没有则按当前设计首抽。</span><button class="mini-button batch" data-generate-batch="1">对勾选项各抽 1 张</button><button class="mini-button batch" data-generate-batch="4">对勾选项各抽 4 张</button></div>
+    </div>
+    <div class="asset-design-list">${cards}</div>
+    <details class="raw-json"><summary>查看 ${escapeHtml(label)} JSON</summary><pre>${escapeHtml(JSON.stringify(content, null, 2))}</pre></details>
+  </div>`;
+}
+
+async function generateCandidateForCard(card, count = 1) {
+  const stage = card.dataset.assetStage;
+  const canonicalKey = card.dataset.canonicalKey;
+  const feedback = card.querySelector("[data-candidate-feedback]")?.value?.trim() || "";
+  const key = `${stage}:${canonicalKey}`;
+  const candidates = currentCandidatesForAsset(stage, canonicalKey);
+  const selected = candidates.find(c => c.selected);
+  const latest = candidates[candidates.length - 1];
+  const baseCandidateId = state.candidateBases[key] || selected?.id || latest?.id || "";
+  const buttons = card.querySelectorAll("[data-generate-candidate]");
+  buttons.forEach(btn => btn.disabled = true);
+  try {
+    toast(`${assetStageLabel(stage)} ${canonicalKey} 正在抽图…`);
+    const result = await api(`/api/workspaces/${state.selectedId}/asset-candidates`, {
+      method: "POST",
+      body: JSON.stringify({stage, canonical_key: canonicalKey, feedback, base_candidate_id: baseCandidateId, count}),
+    });
+    const created = result.items || [];
+    if (created.length) state.candidateBases[key] = created[created.length - 1].id;
+    await refreshCurrent();
+    state.tab = stage;
+    renderDetail();
+    toast(`已生成 ${created.length} 张候选`);
+  } finally {
+    buttons.forEach(btn => btn.disabled = false);
+  }
+}
+
+async function generateBatchCandidates(kind, canonicalKeys, feedback, count = 1, button = null) {
+  if (!canonicalKeys.length) { toast("请先勾选至少一个资产"); return; }
+  if (button) button.disabled = true;
+  try {
+    toast(`正在为 ${canonicalKeys.length} 个${assetStageLabel(kind)}批量抽图…`);
+    const result = await api(`/api/workspaces/${state.selectedId}/asset-candidates/batch`, {
+      method: "POST",
+      body: JSON.stringify({stage: kind, canonical_keys: canonicalKeys, feedback, count}),
+    });
+    const itemsByKey = result.items_by_key || {};
+    Object.entries(itemsByKey).forEach(([canonicalKey, created]) => {
+      if (Array.isArray(created) && created.length) state.candidateBases[`${kind}:${canonicalKey}`] = created[created.length - 1].id;
+    });
+    await refreshCurrent();
+    state.tab = kind;
+    renderDetail();
+    toast(`已为 ${result.asset_count || canonicalKeys.length} 项各生成 ${result.count_per_asset || count} 张候选`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindAssetCandidateUi() {
+  document.querySelectorAll("[data-generate-candidate]").forEach(button => button.addEventListener("click", async () => {
+    const card = button.closest("[data-asset-stage]");
+    if (!card) return;
+    try { await generateCandidateForCard(card, Number(button.dataset.generateCandidate || 1)); }
+    catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-base-candidate]").forEach(button => button.addEventListener("click", () => {
+    const card = button.closest("[data-asset-stage]"); if (!card) return;
+    const key = `${card.dataset.assetStage}:${card.dataset.canonicalKey}`;
+    state.candidateBases[key] = button.dataset.baseCandidate || "";
+    renderDetail();
+    toast("下一次只调整这个候选图");
+  }));
+  document.querySelectorAll("[data-select-candidate]").forEach(button => button.addEventListener("click", async () => {
+    try {
+      await api(`/api/workspaces/${state.selectedId}/asset-candidates/${button.dataset.selectCandidate}/select`, {method:"POST"});
+      await refreshCurrent(); renderDetail(); toast("已设为下游采用图");
+    } catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-delete-candidate]").forEach(button => button.addEventListener("click", async () => {
+    if (!window.confirm("删除这张候选图吗？")) return;
+    try {
+      await api(`/api/workspaces/${state.selectedId}/asset-candidates/${button.dataset.deleteCandidate}`, {method:"DELETE"});
+      await refreshCurrent(); renderDetail(); toast("候选已删除");
+    } catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-batch-select]").forEach(box => box.addEventListener("change", event => {
+    const card = box.closest("[data-asset-stage]");
+    if (!card) return;
+    setBatchSelected(card.dataset.assetStage, card.dataset.canonicalKey, event.target.checked);
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-batch-select-all]").forEach(button => button.addEventListener("click", () => {
+    const workbench = button.closest("[data-batch-workbench]");
+    const kind = workbench?.dataset.batchWorkbench || "";
+    document.querySelectorAll(`[data-asset-stage="${kind}"]`).forEach(card => setBatchSelected(kind, card.dataset.canonicalKey, true));
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-batch-clear]").forEach(button => button.addEventListener("click", () => {
+    const workbench = button.closest("[data-batch-workbench]");
+    const kind = workbench?.dataset.batchWorkbench || "";
+    selectedBatchKeys(kind).forEach(key => setBatchSelected(kind, key, false));
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-generate-batch]").forEach(button => button.addEventListener("click", async () => {
+    const workbench = button.closest("[data-batch-workbench]");
+    const kind = workbench?.dataset.batchWorkbench || "";
+    const canonicalKeys = selectedBatchKeys(kind);
+    const feedback = workbench?.querySelector("[data-batch-feedback]")?.value?.trim() || "";
+    const count = Number(button.dataset.generateBatch || 1);
+    if (!canonicalKeys.length) { toast("请先勾选至少一个资产"); return; }
+    if (!window.confirm(`将为 ${canonicalKeys.length} 个${assetStageLabel(kind)}各生成 ${count} 张候选图。继续吗？`)) return;
+    try { await generateBatchCandidates(kind, canonicalKeys, feedback, count, button); }
+    catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-generate-missing-assets]").forEach(button => button.addEventListener("click", async () => {
+    const workbench = button.closest(".asset-visual-workbench");
+    const cards = Array.from(workbench?.querySelectorAll("[data-asset-stage]") || []).filter(card => currentCandidatesForAsset(card.dataset.assetStage, card.dataset.canonicalKey).length === 0);
+    if (!cards.length) { toast("当前所有资产都已有候选图"); return; }
+    if (!window.confirm(`将调用 Seedream ${cards.length} 次，为 ${cards.length} 个未出图资产各生成 1 张候选。继续吗？`)) return;
+    button.disabled = true;
+    try {
+      for (let i=0; i<cards.length; i++) {
+        toast(`批量抽图 ${i+1}/${cards.length}`);
+        await generateCandidateForCard(cards[i], 1);
+      }
+    } catch (error) { toast(error.message); }
+    finally { button.disabled = false; }
+  }));
 }
 
 function sourceMediaUrl(file) {
@@ -548,10 +828,29 @@ function renderNextAction(actions) {
     : "已完成";
 }
 
+function latestReviewableStage() {
+  const artifacts = new Map((state.detail?.artifacts || []).map(item => [item.kind, item]));
+  const jobs = state.detail?.jobs || [];
+  for (const job of jobs) {
+    const stage = String(job?.stage || "");
+    if (!stage || stage === "source" || job?.status !== "succeeded") continue;
+    const artifact = artifacts.get(stage);
+    if (artifact?.status === "ready") return stage;
+  }
+  return null;
+}
+
 function currentGuidanceStage(actions = state.detail?.next_actions || []) {
   const running = activeJob();
   if (running) return running.stage;
   if (state.chatStageOverride && (state.meta?.stages || []).includes(state.chatStageOverride) && state.chatStageOverride !== "source") return state.chatStageOverride;
+
+  // After a node finishes, keep the composer attached to that ready revision so
+  // "反馈并重生成当前节点" still targets the artifact the user is looking at.
+  // Advancing to the next node explicitly rebinds the composer in advance().
+  const reviewable = latestReviewableStage();
+  if (reviewable) return reviewable;
+
   const action = (actions || [])[0];
   if (!action) return null;
   if (action.type === "run" || action.type === "chat") return action.stage || null;
@@ -578,21 +877,28 @@ function renderGuidancePanel(actions) {
     input.disabled = true;
     input.value = "";
     chatButton.disabled = true;
-    if (regenButton) regenButton.disabled = true;
+    if (regenButton) {
+      regenButton.disabled = true;
+      regenButton.dataset.stage = "";
+    }
     if (flowAdvance) flowAdvance.disabled = true;
     $("#directorPlanView").innerHTML = "";
   } else {
     const agentId = state.meta.stage_agents?.[stage];
     const agent = (state.meta.agents || []).find(item => item.id === agentId);
     const action = (actions || [])[0];
-    const mode = action?.type === "approve" ? "正在评审当前产物" : (action?.type === "chat" ? "总管要求先沟通" : "下一执行节点");
+    const artifact = (state.detail?.artifacts || []).find(item => item.kind === stage);
+    const mode = artifact?.status === "ready"
+      ? "当前评审节点"
+      : (action?.type === "approve" ? "正在评审当前产物" : (action?.type === "chat" ? "总管要求先沟通" : "下一执行节点"));
     $("#guidanceStageLabel").textContent = `${mode}：${state.meta.labels[stage] || stage} · ${agent?.name || "Agent"}`;
     input.disabled = Boolean(running);
     chatButton.disabled = Boolean(running);
-    const artifact = (state.detail?.artifacts || []).find(item => item.kind === stage);
     if (regenButton) {
       regenButton.disabled = Boolean(running) || !artifact || artifact.status !== "ready";
+      regenButton.dataset.stage = artifact?.status === "ready" ? stage : "";
       regenButton.textContent = artifact ? `反馈并重生成${state.meta.labels[stage] || stage}` : "反馈并重生成当前节点";
+      regenButton.title = artifact?.status === "ready" ? `当前绑定：${state.meta.labels[stage] || stage}` : "当前没有 ready 产物可重生成";
     }
     if (flowAdvance) {
       flowAdvance.disabled = Boolean(running) || !(state.detail?.next_actions || []).length;
@@ -656,8 +962,8 @@ async function saveProjectMemory(silent = false) {
   if (!silent) toast("项目记忆已保存");
 }
 
-async function chatStageGuidance(messageOverride = null) {
-  const stage = currentGuidanceStage();
+async function chatStageGuidance(messageOverride = null, stageOverride = null) {
+  const stage = stageOverride || currentGuidanceStage();
   if (!stage || !state.selectedId) throw new Error("当前没有可沟通的模型节点");
   const input = $("#stageGuidanceInput");
   const message = messageOverride !== null ? String(messageOverride) : input.value.trim();
@@ -686,7 +992,9 @@ async function chatStageGuidance(messageOverride = null) {
 async function ensureBoundDirectorPlan(stage) {
   const typed = $("#stageGuidanceInput").value.trim();
   const message = typed || "请结合最新生成结果、项目记忆和已有沟通，确认本节点下一次执行方案；如无阻塞问题，请直接给出可执行指令。";
-  const result = await chatStageGuidance(message);
+  // Bind the director chat to the stage being advanced, not whichever completed
+  // artifact currently owns the review composer.
+  const result = await chatStageGuidance(message, stage);
   const plan = result.plan || {};
   if (plan.requires_user_input) {
     const questions = Array.isArray(plan.questions) ? plan.questions.join("；") : "总管需要更多信息";
@@ -780,7 +1088,12 @@ async function refreshActiveJob() {
     if (["succeeded", "failed"].includes(job.status)) {
       stopJobWatcher();
       if (job.status === "failed") toast(job.message);
-      if (job.status === "succeeded") state.chatStageOverride = "";
+      if (job.status === "succeeded" && job.stage && job.stage !== "source") {
+        // Stay on the revision that just finished so the yellow regenerate button
+        // remains bound to it.  The purple advance action explicitly rebinds to
+        // the next stage when the user chooses to move on.
+        state.chatStageOverride = job.stage;
+      }
       await refreshCurrent();
     }
   } catch (error) {
@@ -791,7 +1104,8 @@ async function refreshActiveJob() {
 }
 
 async function regenerateCurrentStageFromFeedback() {
-  const stage = currentGuidanceStage();
+  const boundStage = $("#regenerateStageBtn")?.dataset?.stage || "";
+  const stage = boundStage || currentGuidanceStage();
   if (!stage || !state.selectedId) throw new Error("当前没有可重生成的节点");
   const input = $("#stageGuidanceInput");
   const feedback = input?.value.trim() || "";
@@ -861,6 +1175,9 @@ async function advance() {
       await setApproval(action.gate, "approved");
       return;
     }
+    // The composer normally remains attached to the most recently completed
+    // artifact for review/regeneration.  Advancing is an explicit stage switch.
+    state.chatStageOverride = action.stage || "";
     const director = await ensureBoundDirectorPlan(action.stage);
     const effective = director.effective_instruction || "";
     const job = await api(`/api/workspaces/${state.selectedId}/run/${action.stage}`, {

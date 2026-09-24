@@ -1,0 +1,9 @@
+覆盖并重启 Harness 后：
+
+1. 不需要重新生成角色 rev4。
+2. 回到角色视觉候选工作台。
+3. 可直接使用之前的批量要求。
+4. 先勾选 1 个角色，点击“对勾选项各抽 1 张”做最小验证。
+5. 若成功返回候选图，再全选 5 个角色批量首抽。
+6. 不应再出现 `sequential_image_generation is not supported by the current model`。
+

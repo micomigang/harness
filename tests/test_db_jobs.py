@@ -169,3 +169,41 @@ def test_stage_review_persists_by_artifact_revision(tmp_path: Path):
     review = db.set_stage_review(ws["id"], "script", 2, {"recommended_action": "regenerate_current"})
     assert review["artifact_revision"] == 2
     assert db.get_stage_review(ws["id"], "script")["review"]["recommended_action"] == "regenerate_current"
+
+
+def test_asset_candidates_are_revision_scoped_and_selection_is_exclusive(tmp_path: Path):
+    db = _db(tmp_path)
+    ws = db.create_workspace("episode", "brief", {})
+    first = db.add_asset_candidate(
+        ws["id"], "characters", 1, "char_grandmere", "char_grandmere",
+        url="/media/a.png", local_path="/tmp/a.png",
+    )
+    second = db.add_asset_candidate(
+        ws["id"], "characters", 1, "char_grandmere", "char_grandmere",
+        feedback="older face", url="/media/b.png", local_path="/tmp/b.png",
+    )
+    db.select_asset_candidate(ws["id"], first["id"])
+    db.select_asset_candidate(ws["id"], second["id"])
+    current = db.list_asset_candidates(
+        ws["id"], stage="characters", canonical_key="char_grandmere", artifact_revision=1,
+    )
+    selected = [item for item in current if item["selected"]]
+    assert [item["id"] for item in selected] == [second["id"]]
+    assert selected[0]["feedback"] == "older face"
+
+    newer = db.add_asset_candidate(
+        ws["id"], "characters", 2, "char_grandmere", "char_grandmere",
+        url="/media/c.png", local_path="/tmp/c.png",
+    )
+    assert db.list_asset_candidates(ws["id"], artifact_revision=2)[0]["id"] == newer["id"]
+
+
+def test_delete_asset_candidates_for_stages_prevents_revision_collision(tmp_path: Path):
+    db = _db(tmp_path)
+    ws = db.create_workspace("episode", "brief", {})
+    db.add_asset_candidate(ws["id"], "characters", 1, "char_a", "char_a", url="/media/a.png")
+    db.add_asset_candidate(ws["id"], "scenes", 1, "scene_a", "scene_a", url="/media/s.png")
+    removed = db.delete_asset_candidates_for_stages(ws["id"], ["characters"])
+    assert len(removed) == 1
+    assert db.list_asset_candidates(ws["id"], stage="characters") == []
+    assert len(db.list_asset_candidates(ws["id"], stage="scenes")) == 1

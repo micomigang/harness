@@ -1,0 +1,25 @@
+EP02 recommended test path after applying this delta
+
+1. Fully stop the old Harness process and restart after overwrite.
+2. Do NOT rerun source analysis, screenplay, or Asset Manifest rev5.
+3. Open the current Characters node (rev1).
+4. Regenerate Characters once with a narrow instruction:
+   - keep the same 5 canonical character identities, plot, relationships, performance and voice anchors;
+   - separate source_visual_traits from localized_visual_design;
+   - culturally adapt source-specific wardrobe to France;
+   - keep narrative function, age/class contrast, recognisable colour family and story-critical accessories;
+   - generation_prompt_en must be English visual instructions;
+   - do not generate images during this text-stage regeneration.
+5. Expect Characters rev2. Inspect char_grandmere first:
+   - source_visual_traits may mention the source red/floral/padded rural coat;
+   - localized_visual_design / wardrobe should be a plausible French-countryside equivalent, not a literal Chinese-style large red floral padded jacket;
+   - generation_prompt_en should be English.
+6. In the visual candidate workbench, generate only 1 candidate for char_grandmere first.
+7. If unsatisfied, enter a local adjustment such as:
+   "Keep the same woman and burgundy identity colour; make the clothing more understated contemporary French countryside, less source-culture floral padded styling."
+   Then generate again based on the current candidate.
+8. When satisfied, click "设为采用并锁定". That selected image becomes the visual anchor used by the Reference Images stage.
+9. Proceed to Scenes and Props normally. New scene/prop generations automatically use the same source-vs-localized-design contract.
+
+Fallback behavior:
+- If you do not regenerate Characters, the existing rev1 can still generate candidates: Seedream receives the new France visual-localization prompt compiler. However the old character-bible text will still show the old wardrobe wording, so regenerating once is cleaner and auditable.

@@ -105,6 +105,21 @@ class StageRegenerationRequest(BaseModel):
     feedback: str = Field(min_length=1, max_length=12000)
 
 
+class AssetCandidateGenerateRequest(BaseModel):
+    stage: Literal["characters", "scenes", "props"]
+    canonical_key: str = Field(min_length=1, max_length=240)
+    feedback: str = Field(default="", max_length=4000)
+    base_candidate_id: str = Field(default="", max_length=128)
+    count: int = Field(default=1, ge=1, le=4)
+
+
+class AssetCandidateBatchGenerateRequest(BaseModel):
+    stage: Literal["characters", "scenes", "props"]
+    canonical_keys: list[str] = Field(min_length=1, max_length=200)
+    feedback: str = Field(default="", max_length=4000)
+    count: int = Field(default=1, ge=1, le=4)
+
+
 class WorkspaceMemoryUpdate(BaseModel):
     memory: str = Field(default="", max_length=30000)
 
@@ -261,6 +276,7 @@ def workspace_detail(workspace_id: str) -> dict[str, Any]:
         "stage_reviews": db.list_stage_reviews(workspace_id),
         "asset_libraries": db.list_workspace_asset_libraries(workspace_id),
         "asset_library_context": db.workspace_asset_context(workspace_id),
+        "asset_candidates": db.list_asset_candidates(workspace_id, limit=500),
         "activity_feed": db.list_activity_feed(workspace_id, limit=220),
         "next_actions": orchestrator.next_actions(workspace_id),
     }
@@ -535,6 +551,256 @@ def import_artifact_assets(workspace_id: str, library_id: str, kind: str) -> dic
     db.link_workspace_asset_library(workspace_id, library_id)
     db.add_event(workspace_id, "asset_library.imported_artifact", {"library_id": library_id, "kind": kind, "item_count": len(added)})
     return {"library": library, "items": added}
+
+
+def _current_stage_asset(workspace_id: str, stage: str, canonical_key: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if stage not in {"characters", "scenes", "props"}:
+        raise HTTPException(400, "Visual candidate workbench only supports characters/scenes/props")
+    artifact = db.get_artifact(workspace_id, stage)
+    if not artifact or artifact.get("status") != "ready":
+        raise HTTPException(409, f"{STAGE_LABELS.get(stage, stage)} artifact is not ready")
+    items = (artifact.get("content") or {}).get("items") or []
+    item = next(
+        (
+            candidate for candidate in items
+            if isinstance(candidate, dict)
+            and str(candidate.get("canonical_key") or candidate.get("id") or "") == canonical_key
+        ),
+        None,
+    )
+    if not item:
+        raise HTTPException(404, "Asset item not found in the current artifact revision")
+    return artifact, item
+
+
+def _current_stage_asset_candidates_base(workspace_id: str, stage: str, canonical_key: str, artifact: dict[str, Any], base_candidate_id: str = "") -> dict[str, Any] | None:
+    base = None
+    if base_candidate_id:
+        base = db.get_asset_candidate(base_candidate_id)
+        if not base or str(base.get("workspace_id") or "") != workspace_id:
+            raise HTTPException(404, "Base candidate not found")
+        if str(base.get("stage") or "") != stage or str(base.get("canonical_key") or "") != canonical_key:
+            raise HTTPException(400, "Base candidate belongs to another asset")
+    if base is None:
+        selected = db.list_asset_candidates(
+            workspace_id,
+            stage=stage,
+            canonical_key=canonical_key,
+            artifact_revision=int(artifact.get("revision") or 0),
+            selected_only=True,
+            limit=1,
+        )
+        base = selected[0] if selected else None
+    return base
+
+
+def _asset_candidate_localization_context(workspace_id: str) -> dict[str, Any]:
+    workspace = db.get_workspace(workspace_id) or {}
+    settings_json = workspace.get("settings") if isinstance(workspace.get("settings"), dict) else {}
+    script_artifact = db.get_artifact(workspace_id, "script")
+    script_content = (script_artifact or {}).get("content") if isinstance(script_artifact, dict) else {}
+    if not isinstance(script_content, dict):
+        script_content = {}
+    return {
+        "target_market": str(settings_json.get("target_market") or script_content.get("target_market") or "").strip(),
+        "target_language": str(settings_json.get("target_language") or script_content.get("language") or "").strip(),
+        "localization_strategy": str(script_content.get("localization_strategy") or "").strip(),
+        "adaptation_notes": script_content.get("adaptation_notes") or [],
+        "localization_map": script_content.get("localization_map") or [],
+    }
+
+
+def _generate_asset_candidate_images(
+    workspace_id: str,
+    stage: str,
+    artifact: dict[str, Any],
+    item: dict[str, Any],
+    feedback: str,
+    count: int,
+    base: dict[str, Any] | None,
+    localization_context: dict[str, Any],
+) -> list[dict[str, Any]]:
+    workflow = orchestrator.providers.workflow()
+    image_provider = getattr(workflow, "image", None)
+    generate_method = getattr(image_provider, "generate_candidate", None)
+    if not callable(generate_method):
+        raise HTTPException(409, "当前 Provider 未配置可交互的 Seedream 图片生成能力")
+    created: list[dict[str, Any]] = []
+    for _ in range(count):
+        try:
+            generated = generate_method(
+                workspace_id=workspace_id,
+                source_kind=stage,
+                item=item,
+                feedback=feedback,
+                reference_url=str((base or {}).get("remote_url") or ""),
+                reference_local_path=str((base or {}).get("local_path") or ""),
+                localization_context=localization_context,
+            )
+        except Exception as exc:
+            raise HTTPException(502, str(exc)) from exc
+        created.append(
+            db.add_asset_candidate(
+                workspace_id,
+                stage,
+                int(artifact.get("revision") or 0),
+                str(item.get("canonical_key") or item.get("id") or ""),
+                str(item.get("id") or item.get("canonical_key") or ""),
+                feedback=feedback.strip(),
+                base_candidate_id=str((base or {}).get("id") or ""),
+                prompt=str(generated.get("prompt") or ""),
+                model=str(generated.get("model") or ""),
+                remote_url=str(generated.get("remote_url") or ""),
+                url=str(generated.get("url") or ""),
+                local_path=str(generated.get("local_path") or ""),
+            )
+        )
+    return created
+
+
+@app.post("/api/workspaces/{workspace_id}/asset-candidates")
+def generate_asset_candidates(
+    workspace_id: str,
+    payload: AssetCandidateGenerateRequest,
+) -> dict[str, Any]:
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    artifact, item = _current_stage_asset(workspace_id, payload.stage, payload.canonical_key)
+    base = _current_stage_asset_candidates_base(workspace_id, payload.stage, payload.canonical_key, artifact, payload.base_candidate_id)
+    localization_context = _asset_candidate_localization_context(workspace_id)
+    created = _generate_asset_candidate_images(
+        workspace_id,
+        payload.stage,
+        artifact,
+        item,
+        payload.feedback,
+        payload.count,
+        base,
+        localization_context,
+    )
+    db.add_event(
+        workspace_id,
+        "asset_candidate.generated",
+        {
+            "stage": payload.stage,
+            "canonical_key": payload.canonical_key,
+            "artifact_revision": int(artifact.get("revision") or 0),
+            "count": len(created),
+            "base_candidate_id": str((base or {}).get("id") or ""),
+            "has_feedback": bool(payload.feedback.strip()),
+        },
+    )
+    return {"items": created, "artifact_revision": int(artifact.get("revision") or 0)}
+
+
+@app.post("/api/workspaces/{workspace_id}/asset-candidates/batch")
+def generate_asset_candidates_batch(
+    workspace_id: str,
+    payload: AssetCandidateBatchGenerateRequest,
+) -> dict[str, Any]:
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    cleaned_keys: list[str] = []
+    seen: set[str] = set()
+    for raw in payload.canonical_keys:
+        key = str(raw or "").strip()
+        if not key or key in seen:
+            continue
+        cleaned_keys.append(key)
+        seen.add(key)
+    if not cleaned_keys:
+        raise HTTPException(400, "No asset keys selected")
+    localization_context = _asset_candidate_localization_context(workspace_id)
+    items_by_key: dict[str, list[dict[str, Any]]] = {}
+    artifact_revision = 0
+    for canonical_key in cleaned_keys:
+        artifact, item = _current_stage_asset(workspace_id, payload.stage, canonical_key)
+        artifact_revision = int(artifact.get("revision") or artifact_revision or 0)
+        base = _current_stage_asset_candidates_base(workspace_id, payload.stage, canonical_key, artifact, "")
+        created = _generate_asset_candidate_images(
+            workspace_id,
+            payload.stage,
+            artifact,
+            item,
+            payload.feedback,
+            payload.count,
+            base,
+            localization_context,
+        )
+        items_by_key[canonical_key] = created
+    db.add_event(
+        workspace_id,
+        "asset_candidate.batch_generated",
+        {
+            "stage": payload.stage,
+            "canonical_keys": cleaned_keys,
+            "artifact_revision": artifact_revision,
+            "count_per_asset": int(payload.count),
+            "asset_count": len(cleaned_keys),
+            "has_feedback": bool(payload.feedback.strip()),
+        },
+    )
+    return {
+        "items_by_key": items_by_key,
+        "artifact_revision": artifact_revision,
+        "asset_count": len(cleaned_keys),
+        "count_per_asset": int(payload.count),
+    }
+
+
+@app.post("/api/workspaces/{workspace_id}/asset-candidates/{candidate_id}/select")
+def select_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, Any]:
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    candidate = db.get_asset_candidate(candidate_id)
+    if not candidate or str(candidate.get("workspace_id") or "") != workspace_id:
+        raise HTTPException(404, "Asset candidate not found")
+    artifact, _ = _current_stage_asset(
+        workspace_id,
+        str(candidate.get("stage") or ""),
+        str(candidate.get("canonical_key") or ""),
+    )
+    if int(candidate.get("artifact_revision") or 0) != int(artifact.get("revision") or 0):
+        raise HTTPException(409, "该候选图属于旧版本资产，请在当前 revision 重新抽图")
+    selected = db.select_asset_candidate(workspace_id, candidate_id)
+    invalidated = orchestrator.invalidate_downstream(workspace_id, str(candidate.get("stage") or ""))
+    if invalidated:
+        db.clear_stage_reviews(workspace_id, invalidated)
+        for gate_stage, gate_name in GATES.items():
+            if gate_stage in invalidated:
+                db.set_approval(workspace_id, gate_name, "pending", "视觉候选已重新选定")
+    db.add_event(
+        workspace_id,
+        "asset_candidate.selected",
+        {
+            "stage": candidate.get("stage"),
+            "canonical_key": candidate.get("canonical_key"),
+            "candidate_id": candidate_id,
+            "downstream_invalidated": invalidated,
+        },
+    )
+    return {"candidate": selected, "downstream_invalidated": invalidated}
+
+
+@app.delete("/api/workspaces/{workspace_id}/asset-candidates/{candidate_id}")
+def delete_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, Any]:
+    existing = db.get_asset_candidate(candidate_id)
+    if not existing or str(existing.get("workspace_id") or "") != workspace_id:
+        raise HTTPException(404, "Asset candidate not found")
+    if existing.get("selected"):
+        raise HTTPException(409, "这张候选图正在被下游采用；请先选择另一张再删除")
+    candidate = db.delete_asset_candidate(workspace_id, candidate_id)
+    if not candidate:
+        raise HTTPException(404, "Asset candidate not found")
+    local_path = Path(str(candidate.get("local_path") or ""))
+    if local_path.is_file():
+        local_path.unlink(missing_ok=True)
+    db.add_event(
+        workspace_id,
+        "asset_candidate.deleted",
+        {"stage": candidate.get("stage"), "canonical_key": candidate.get("canonical_key"), "candidate_id": candidate_id},
+    )
+    return {"status": "deleted", "candidate_id": candidate_id}
 
 
 @app.post("/api/workspaces/{workspace_id}/run/{stage}")

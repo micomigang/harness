@@ -16,8 +16,8 @@ def test_upload_uses_native_label_file_picker():
 
 def test_frontend_assets_are_versioned_to_avoid_mixed_cache():
     html = (_root() / "static" / "index.html").read_text(encoding="utf-8")
-    assert '/static/app.js?v=20260923-v11' in html
-    assert '/static/style.css?v=20260923-v11' in html
+    assert '/static/app.js?v=20260924-v12-visual-workbench-long-canvas' in html
+    assert '/static/style.css?v=20260924-v12-visual-workbench-long-canvas' in html
 
 
 def test_workspace_bootstrap_is_not_blocked_by_health_or_meta_failure():
@@ -51,3 +51,32 @@ def test_flow_chat_is_pinned_into_main_canvas_and_compacts_job_updates():
     assert '.canvas.flow-active .artifact-grid.stream-mode' in css
     assert '.canvas.flow-active .flow-composer' in css
     assert 'overflow-y: auto' in css
+
+
+def test_regenerate_button_stays_bound_to_latest_ready_completed_stage():
+    js = (_root() / "static" / "app.js").read_text(encoding="utf-8")
+    assert "function latestReviewableStage()" in js
+    assert 'if (reviewable) return reviewable;' in js
+    assert 'regenButton.dataset.stage = artifact?.status === "ready" ? stage : "";' in js
+    assert 'const boundStage = $("#regenerateStageBtn")?.dataset?.stage || "";' in js
+    assert 'state.chatStageOverride = job.stage;' in js
+
+
+def test_advancing_explicitly_rebinds_director_chat_to_next_stage():
+    js = (_root() / "static" / "app.js").read_text(encoding="utf-8")
+    assert "async function chatStageGuidance(messageOverride = null, stageOverride = null)" in js
+    assert "const stage = stageOverride || currentGuidanceStage();" in js
+    assert "const result = await chatStageGuidance(message, stage);" in js
+    assert 'state.chatStageOverride = action.stage || "";' in js
+
+
+def test_visual_asset_workbench_uses_long_canvas_and_shows_director_review_state():
+    js = (_root() / "static" / "app.js").read_text(encoding="utf-8")
+    css = (_root() / "static" / "style.css").read_text(encoding="utf-8")
+    assert 'asset-workbench-card' in js
+    assert '总管已通过' in js
+    assert '总管待修' in js
+    assert '.artifact-card.asset-workbench-card .artifact-content' in css
+    assert 'max-height: none' in css
+    assert '.artifact-card.asset-workbench-card .candidate-editor textarea' in css
+    assert 'min-height: 118px' in css

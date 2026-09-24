@@ -1,0 +1,13 @@
+EP02 测试步骤（不要回退素材/剧本/Asset Manifest）
+
+1. 覆盖本增量包并彻底重启 Harness。
+2. 打开 Mamie 归家 · EP02，停留在「角色」节点。
+3. 不删除 characters rev3，不清空区域。
+4. 直接点击粉色「按总管复盘重新生成角色」一次，生成新的 characters revision（预计 rev4）。
+5. 检查 char_grandmere：
+   - 源素材连续性（仅归档）允许出现 Chinese red floral padded coat / mandarin collar / frog buttons 等源事实。
+   - 成片连续性锁必须是法国化规则，例如 deep burgundy quilted French countryside jacket；不得出现 source-only floral padded jacket / mandarin collar / frog buttons。
+   - production_continuity_lock 与 continuity_lock 应一致。
+   - source_continuity_lock 与 continuity_lock 在发生文化本地化时不得完全相同。
+6. 检查 continuity_localization_validation.status = pass。
+7. 若通过，不再重生成角色圣经，开始 char_grandmere 的视觉候选「抽 1 张」。

@@ -159,6 +159,27 @@ class Database:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(workspace_id, library_id)
                 );
+                CREATE TABLE IF NOT EXISTS asset_candidates (
+                    id TEXT PRIMARY KEY,
+                    workspace_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    artifact_revision INTEGER NOT NULL,
+                    canonical_key TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    feedback TEXT NOT NULL,
+                    base_candidate_id TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    remote_url TEXT NOT NULL,
+                    url TEXT NOT NULL,
+                    local_path TEXT NOT NULL,
+                    selected INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(workspace_id) REFERENCES workspaces(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_asset_candidates_workspace_stage
+                    ON asset_candidates(workspace_id, stage, artifact_revision, canonical_key, created_at);
                 """
             )
             job_columns = {
@@ -607,7 +628,7 @@ class Database:
             ).fetchone()
             if not exists:
                 return False
-            for table in ("workspace_asset_libraries", "stage_reviews", "guidance_messages", "stage_guidance", "workspace_memory", "events", "jobs", "approvals", "artifacts"):
+            for table in ("asset_candidates", "workspace_asset_libraries", "stage_reviews", "guidance_messages", "stage_guidance", "workspace_memory", "events", "jobs", "approvals", "artifacts"):
                 conn.execute(f"DELETE FROM {table} WHERE workspace_id=?", (workspace_id,))
             conn.execute("DELETE FROM workspaces WHERE id=?", (workspace_id,))
         return True
@@ -977,6 +998,102 @@ class Database:
             })
         return result
 
+    def add_asset_candidate(
+        self, workspace_id: str, stage: str, artifact_revision: int, canonical_key: str,
+        source_id: str, *, feedback: str = "", base_candidate_id: str = "", prompt: str = "",
+        model: str = "", remote_url: str = "", url: str = "", local_path: str = "",
+        selected: bool = False,
+    ) -> dict[str, Any]:
+        candidate_id = str(uuid.uuid4())
+        now = utcnow()
+        with self._lock, self.connect() as conn:
+            if selected:
+                conn.execute(
+                    "UPDATE asset_candidates SET selected=0, updated_at=? WHERE workspace_id=? AND stage=? AND artifact_revision=? AND canonical_key=?",
+                    (now, workspace_id, stage, int(artifact_revision), canonical_key),
+                )
+            conn.execute(
+                "INSERT INTO asset_candidates (id, workspace_id, stage, artifact_revision, canonical_key, source_id, feedback, base_candidate_id, prompt, model, remote_url, url, local_path, selected, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (candidate_id, workspace_id, stage, int(artifact_revision), canonical_key, source_id, feedback, base_candidate_id, prompt, model, remote_url, url, local_path, 1 if selected else 0, now, now),
+            )
+            row = conn.execute("SELECT * FROM asset_candidates WHERE id=?", (candidate_id,)).fetchone()
+        return self._asset_candidate(row)
+
+    def get_asset_candidate(self, candidate_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM asset_candidates WHERE id=?", (candidate_id,)).fetchone()
+        return self._asset_candidate(row) if row else None
+
+    def list_asset_candidates(
+        self, workspace_id: str, *, stage: str = "", canonical_key: str = "",
+        artifact_revision: int | None = None, selected_only: bool = False, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses = ["workspace_id=?"]
+        values: list[Any] = [workspace_id]
+        if stage:
+            clauses.append("stage=?"); values.append(stage)
+        if canonical_key:
+            clauses.append("canonical_key=?"); values.append(canonical_key)
+        if artifact_revision is not None:
+            clauses.append("artifact_revision=?"); values.append(int(artifact_revision))
+        if selected_only:
+            clauses.append("selected=1")
+        values.append(max(1, int(limit)))
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM asset_candidates WHERE " + " AND ".join(clauses) + " ORDER BY created_at DESC LIMIT ?",
+                values,
+            ).fetchall()
+        return [self._asset_candidate(row) for row in rows]
+
+    def delete_asset_candidates_for_stages(self, workspace_id: str, stages: list[str]) -> list[dict[str, Any]]:
+        if not stages:
+            return []
+        placeholders = ",".join("?" for _ in stages)
+        with self._lock, self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM asset_candidates WHERE workspace_id=? AND stage IN ({placeholders})",
+                (workspace_id, *stages),
+            ).fetchall()
+            if rows:
+                conn.execute(
+                    f"DELETE FROM asset_candidates WHERE workspace_id=? AND stage IN ({placeholders})",
+                    (workspace_id, *stages),
+                )
+        return [self._asset_candidate(row) for row in rows]
+
+    def select_asset_candidate(self, workspace_id: str, candidate_id: str) -> dict[str, Any] | None:
+        now = utcnow()
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM asset_candidates WHERE id=? AND workspace_id=?",
+                (candidate_id, workspace_id),
+            ).fetchone()
+            if not row:
+                return None
+            conn.execute(
+                "UPDATE asset_candidates SET selected=0, updated_at=? WHERE workspace_id=? AND stage=? AND artifact_revision=? AND canonical_key=?",
+                (now, workspace_id, row["stage"], int(row["artifact_revision"]), row["canonical_key"]),
+            )
+            conn.execute(
+                "UPDATE asset_candidates SET selected=1, updated_at=? WHERE id=?",
+                (now, candidate_id),
+            )
+            updated = conn.execute("SELECT * FROM asset_candidates WHERE id=?", (candidate_id,)).fetchone()
+        return self._asset_candidate(updated)
+
+    def delete_asset_candidate(self, workspace_id: str, candidate_id: str) -> dict[str, Any] | None:
+        with self._lock, self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM asset_candidates WHERE id=? AND workspace_id=?",
+                (candidate_id, workspace_id),
+            ).fetchone()
+            if not row:
+                return None
+            item = self._asset_candidate(row)
+            conn.execute("DELETE FROM asset_candidates WHERE id=?", (candidate_id,))
+        return item
+
     def list_activity_feed(self, workspace_id: str, limit: int = 180) -> list[dict[str, Any]]:
         feed=[]
         for item in self.list_guidance_messages(workspace_id, limit=limit):
@@ -988,7 +1105,7 @@ class Database:
 
     def workspace_activity_token(self, workspace_id: str) -> str:
         with self.connect() as conn:
-            rows=[conn.execute("SELECT MAX(id) AS value FROM events WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(id) AS value FROM guidance_messages WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(updated_at) AS value FROM jobs WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(updated_at) AS value FROM artifacts WHERE workspace_id=?",(workspace_id,)).fetchone()]
+            rows=[conn.execute("SELECT MAX(id) AS value FROM events WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(id) AS value FROM guidance_messages WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(updated_at) AS value FROM jobs WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(updated_at) AS value FROM artifacts WHERE workspace_id=?",(workspace_id,)).fetchone(),conn.execute("SELECT MAX(updated_at) AS value FROM asset_candidates WHERE workspace_id=?",(workspace_id,)).fetchone()]
         return "|".join(str((row["value"] if row else "") or "") for row in rows)
 
     def add_event(self, workspace_id: str, event_type: str, payload: Any) -> None:
@@ -1012,6 +1129,12 @@ class Database:
             }
             for row in rows
         ]
+
+    @staticmethod
+    def _asset_candidate(row: sqlite3.Row) -> dict[str, Any]:
+        item = dict(row)
+        item["selected"] = bool(item.get("selected"))
+        return item
 
     @staticmethod
     def _job(row: sqlite3.Row) -> dict[str, Any]:
