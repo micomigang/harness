@@ -1,0 +1,20 @@
+覆盖后完全重启 Harness。
+
+测试起点：当前《Mamie 归家 · EP02》的「资产解析」节点。
+不要重跑素材、素材分析或剧本；保留当前 rev3。
+
+建议在反馈框输入：
+保留当前 rev3 已识别出的资产语义集合与证据，不按历史数量做配额。请按 Harness 当前 Asset Manifest schema 重新 reconcile：script.asset_requirements 只通过 source_requirement_keys 绑定，canonical_key 保留稳定的 char_/scene_/prop_ 生产身份；continuity_lock 使用规则数组；补齐 character/scene/prop 的显式 typed metadata；不改剧情、不新增无证据资产、不生成媒体。
+
+然后点击黄色「反馈并重生成资产解析」，生成下一 revision（预计 rev4）。
+
+重点验收：
+1. canonical_key 为 char_*/scene_*/prop_*，不再被 CHAR_*/LOC_*/PROP_* 覆盖。
+2. 每个 screenplay baseline item 有 source_requirement_keys；11 项 baseline 全覆盖。
+3. scene_couloir_rdc 不再残留 set_ground_floor_corridor。
+4. prop_mysterious_travel_bag 唯一，continuity_lock 为非空字符串数组。
+5. character 有 appearance + costume；scene 有 key_set_elements；prop 有 physical_description + used_in_scenes。
+6. manifest_validation.status == pass；missing/duplicate/illegal/continuity/typed metadata checks 均通过。
+7. 制作对话流不再显示 [object Object]。
+
+通过后再进入「角色」阶段，不需要回到上游重新分析视频。

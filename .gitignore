@@ -1,0 +1,49 @@
+# ===== Secrets / environment =====
+.env
+.env.*
+!.env.example
+
+# ===== Python virtual environment =====
+.venv/
+venv/
+env/
+
+# ===== Python cache =====
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ===== Runtime / local data =====
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== Temporary/cache =====
+cache/
+tmp/
+temp/
+
+# ===== IDE / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+
+# ===== Large media =====
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+
+# Generated frames / outputs
+frames/
+**/frames/
+outputs/
+generated/
+
+# Local FFmpeg binaries
+tools/ffmpeg-release/
+tools/ffmpeg-release-essentials.zip

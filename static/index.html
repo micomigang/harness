@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>爆款复制 Harness</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260923-v11">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-dot"></span>爆款复制 Harness</div>
+    <div class="topbar-actions">
+      <span id="providerBadge" class="badge">provider: —</span>
+      <button id="newWorkspaceBtn" class="button secondary">新建工作区</button>
+      <button id="deleteWorkspaceBtn" class="button danger" disabled>删除当前工作区</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <aside class="sidebar panel">
+      <div class="sidebar-heading">
+        <div class="panel-title">工作区</div>
+        <button id="refreshWorkspacesBtn" class="mini-button" type="button">刷新</button>
+      </div>
+      <div id="workspaceList" class="workspace-list"></div>
+      <div class="sidebar-note">
+        本地 harness 保存结构化状态、审批和依赖。Mock 模式不会消耗外部积分。
+      </div>
+    </aside>
+
+    <section class="workspace panel">
+      <div id="emptyState" class="empty-state">
+        <div class="empty-orb"></div>
+        <h1>爆款复制工作流</h1>
+        <p>从素材分析到最终合成，保留每一步的结构化产物、人工确认和级联失效记录。</p>
+        <button id="emptyCreateBtn" class="button primary">创建演示工作区</button>
+      </div>
+
+      <div id="workspaceView" class="workspace-view hidden">
+        <div class="workspace-heading">
+          <div>
+            <div class="eyebrow">LOCAL PRODUCTION SPACE</div>
+            <h1 id="workspaceTitle"></h1>
+            <p id="workspaceBrief"></p>
+          </div>
+          <div class="workspace-metrics">
+            <div><strong id="artifactCount">0</strong><span>产物</span></div>
+            <div><strong id="jobCount">0</strong><span>任务</span></div>
+            <div><strong id="approvedCount">0</strong><span>确认</span></div>
+          </div>
+        </div>
+
+        <nav id="stageRail" class="stage-rail"></nav>
+
+        <div class="canvas-layout">
+          <section class="canvas">
+            <div class="canvas-toolbar">
+              <div id="stageTabs" class="stage-tabs"></div>
+              <div class="toolbar-actions">
+                <input id="sourceFileInput" class="native-file-input" type="file" accept="video/*">
+                <label id="uploadSourceBtn" for="sourceFileInput" class="button secondary file-picker-button" role="button" tabindex="0">上传源视频</label>
+                <span id="uploadStatus" class="upload-status" aria-live="polite"></span>
+                <button id="clearJobsBtn" class="button secondary">清理任务记录</button>
+                <button id="clearStageBtn" class="button danger">清理当前区域</button>
+                <button id="advanceBtn" class="button primary">按要求推进下一步</button>
+              </div>
+            </div>
+            <div id="artifactGrid" class="artifact-grid"></div>
+            <div id="flowComposer" class="flow-composer hidden">
+              <div class="flow-composer-head">
+                <div>
+                  <div class="eyebrow">DIRECTOR CHAT</div>
+                  <div id="guidanceStageLabel" class="guidance-stage">等待下一步</div>
+                </div>
+                <span id="flowComposerMode" class="pill">对话</span>
+              </div>
+              <div class="flow-context-details">
+                <details>
+                  <summary>当前绑定要求</summary>
+                  <div id="effectiveGuidanceView" class="effective-guidance"></div>
+                </details>
+                <details>
+                  <summary>总管执行方案</summary>
+                  <div id="directorPlanView" class="director-plan"></div>
+                </details>
+              </div>
+              <textarea id="stageGuidanceInput" class="guidance-input flow-chat-input" rows="3" placeholder="直接在这里和总管对话：提出修改意见、补充要求，或说明下一步目标。Enter 发送，Shift+Enter 换行。"></textarea>
+              <div class="flow-composer-actions">
+                <button id="saveGuidanceBtn" class="button secondary">发送</button>
+                <button id="regenerateStageBtn" class="button warn">反馈并重生成当前节点</button>
+                <button id="flowAdvanceBtn" class="button primary">推进下一步</button>
+              </div>
+              <div class="artifact-meta guidance-binding-note">你的消息会保存到当前节点对话记录；“反馈并重生成”会保留项目记忆、对话历史和当前 revision 快照，只让本节点及其下游重新生成。</div>
+            </div>
+          </section>
+
+          <aside class="agent-panel">
+            <div class="agent-header">
+              <div>
+                <span class="agent-avatar">✦</span>
+                <strong>艺术总监 / Orchestrator</strong>
+              </div>
+              <span class="status-dot"></span>
+            </div>
+            <div id="nextAction" class="next-action"></div>
+            <div class="agent-section director-console">
+              <h3>总管状态 / 长期记忆</h3>
+              <div id="directorSidebarHint" class="artifact-meta">对话输入已合并到中央“制作对话流”。你可以像聊天一样给意见、重生成或推进下一步。</div>
+              <details class="memory-box" open>
+                <summary>项目记忆 / 长期上下文</summary>
+                <textarea id="projectMemoryInput" class="guidance-input" rows="6" placeholder="写入跨步骤长期生效的规则，例如：目标市场法国；保留原剧情结构；所有对白使用自然法国法语；角色关系不可改；不要添加原片不存在的超自然设定。"></textarea>
+                <button id="saveMemoryBtn" class="mini-button">保存项目记忆</button>
+              </details>
+            </div>
+            <div class="agent-section">
+              <h3>二次确认</h3>
+              <div id="approvalList"></div>
+            </div>
+            <div class="agent-section">
+              <h3>任务列表</h3>
+              <div id="jobList"></div>
+            </div>
+            <div class="agent-section">
+              <h3>执行记录</h3>
+              <div id="eventList" class="event-list"></div>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="createDialog">
+    <form id="createForm" method="dialog">
+      <div class="dialog-heading">
+        <div>
+          <div class="eyebrow">NEW EPISODE</div>
+          <h2>新建独立短片工作区</h2>
+        </div>
+        <button type="button" id="closeDialogBtn" class="icon-button">×</button>
+      </div>
+      <label>项目名<input name="title" value="Mamie 归家 · EP01" required></label>
+      <label>本集素材/制作说明<textarea name="brief" rows="8" required>家庭轻喜剧打脸爽剧。保持原片核心剧情、人物功能、冲突、反转和结尾钩子；后续按工作区的目标市场和每一步用户要求做本地化与制作。</textarea></label>
+      <div class="form-row">
+        <label>画幅<input name="aspect_ratio" value="9:16"></label>
+        <label>目标分镜数<input name="storyboard_count" type="number" min="1" max="100" value="17"></label>
+      </div>
+      <div class="form-row">
+        <label>目标语言<input name="target_language" value="French (France)"></label>
+        <label>目标市场<input name="target_market" value="France"></label>
+      </div>
+      <div class="form-row">
+        <label>所属系列<select id="workspaceSeriesSelect" name="series_id"><option value="">独立项目（不继承系列资产）</option><option value="__new__">＋ 新建系列</option></select></label>
+        <label>集数 / 项目标识<input name="episode_key" value="EP01" placeholder="例如 EP01"></label>
+      </div>
+      <label id="newSeriesNameLabel" class="hidden">新系列名称<input name="series_name" placeholder="例如：Mamie 归家"></label>
+      <label>项目记忆 / 长期要求<textarea name="project_memory" rows="5">目标市场为法国。后续所有创作优先做自然的法国本地化，而不是逐字翻译；保留源片核心故事功能与反转；任何无法从素材确认的事实要明确标注。</textarea></label>
+      <div class="dialog-actions">
+        <button type="button" id="cancelDialogBtn" class="button secondary">取消</button>
+        <button type="submit" class="button primary">创建</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="assetLibraryDialog">
+    <form id="assetLibraryForm" method="dialog">
+      <div class="dialog-heading">
+        <div><div class="eyebrow">SHARED ASSET LIBRARY</div><h2>新建主题资料库</h2></div>
+        <button type="button" id="closeAssetLibraryDialogBtn" class="icon-button">×</button>
+      </div>
+      <label>资料库名称<input name="name" placeholder="例如：法国现代豪宅家庭" required></label>
+      <label>主题<input name="theme" placeholder="例如：France · Contemporary · Bourgeois Family" required></label>
+      <label>资料库类型<select name="scope"><option value="mixed">混合资产库</option><option value="character">人物库</option><option value="scene">场景库</option><option value="prop">道具库</option><option value="reference">参考图库</option></select></label>
+      <label>说明<textarea name="description" rows="5" placeholder="描述这个资料库适合复用的人物、场景、道具、时代、地域和视觉规则。"></textarea></label>
+      <div class="dialog-actions"><button type="button" class="button secondary" onclick="document.querySelector('#assetLibraryDialog').close()">取消</button><button type="submit" class="button primary">创建并挂载当前项目</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js?v=20260923-v11"></script>
+</body>
+</html>

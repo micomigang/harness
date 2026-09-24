@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: viral-copy-harness
+Version: 0.2.0
+Summary: 爆款复制 Harness：Kimi、Seedream、Seedance 与本地 FFmpeg 驱动的短视频工作流。
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1,>=0.115
+Requires-Dist: uvicorn[standard]<1,>=0.30
+Requires-Dist: httpx<1,>=0.27
+Requires-Dist: python-multipart<1,>=0.0.9
+Requires-Dist: python-dotenv<2,>=1
+Provides-Extra: dev
+Requires-Dist: pytest<9,>=8; extra == "dev"
