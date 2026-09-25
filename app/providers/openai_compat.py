@@ -96,6 +96,7 @@ DIRECTOR_REVIEW_SYSTEM_PROMPT = (
     "recommended_action should be one of proceed, approve_current, regenerate_current, adjust_next_stage, wait_for_user. Use regenerate_current when the artifact materially violates a bound acceptance criterion, invents unsupported facts as source evidence, or is structurally unusable downstream; do not recommend approval merely because an artifact exists. "
     "For asset_manifest, generated_artifact.content.manifest_validation is the deterministic harness authority for schema and screenplay coverage. Treat missing_required_keys / required_baseline_coverage as authoritative for script.asset_requirements coverage. screenplay IDs belong in source_requirement_keys and are NOT required to equal canonical_key; do not flag normalized char_*/scene_*/prop_* canonical keys merely because the screenplay uses CHAR_*/LOC_*/PROP_* IDs. Treat duplicate_canonical_semantic_check, illegal_asset_type_check, continuity_lock_check and typed_metadata_check as authoritative when present. If typed_metadata_check.status=pass, you MUST NOT claim that typed metadata fields are missing or require any new field names beyond typed_metadata_check.required_fields. In particular, physical_tags, social_register, lighting_mood, spatial_function, architectural_style, material, dimensions_hint and narrative_function are OPTIONAL unless the latest bound user instruction explicitly names them. continuity_lock is canonically encoded as an array of rule strings; if older user/director prose says continuity_lock=true/false, interpret that only as lock intent and never flag the array encoding as a deviation. Review the complete compact items list supplied by the harness rather than assuming it is truncated. You may still flag semantic/content-specific assets explicitly required by the bound instruction. Do not invent a target item count; an approximate expected count is diagnostic only. Never recommend regeneration merely to restore old costume/set taxonomy, screenplay IDs as manifest keys, boolean lock encoding, invented schema fields, or historical 10/12/14 counts when deterministic validation passes. "
     "For characters/scenes/props reviews, do not demand literal retention of a source-culture costume, interior or prop styling when the localized production is set in another target market. Accept an explicit source_visual_traits -> localized_visual_design mapping when narrative function, identity and continuity anchors are preserved. source_continuity_lock is an archival SOURCE field; continuity_lock / production_continuity_lock are the TARGET-MARKET production authority. If visual localization changes culturally specific styling, source_continuity_lock and continuity_lock should not be identical, and source-only styling must not be required downstream. When generated_artifact.content.continuity_localization_validation is present, treat its status/issues as deterministic harness evidence. generation_prompt_en is provider-facing English and is not required to match the story-language prose word-for-word."
+    "For reference_images reviews, generated_artifact.content.reference_validation is the deterministic harness authority for coverage, source-kind legality and planned-vs-actual combination bindings when present. Review the complete compact reference-items list supplied by the harness rather than inferring absence from a preview limit. asset_library_context and user-selected visual candidates are different stores; an empty thematic asset library does not negate selected upstream candidates. Canonical source_kind values are character, scene, prop and combination; combination source_id/source_ids may be arrays. Status/provenance wording is secondary to reference_validation and actual candidate bindings."
 )
 
 SEGMENT_ANALYSIS_TASK = (
@@ -175,6 +176,7 @@ class OpenAICompatibleProvider(WorkflowProvider):
             "upstream_context": self._director_upstream_context(stage, context),
             "allowed_parameter_overrides": allowed_parameter_description(stage),
             "asset_library_context": self._sanitize_for_external(context.get("asset_library_context", [])),
+            "asset_candidates": self._sanitize_for_external(context.get("asset_candidates", [])),
         }
         payload = {
             "model": self.model,
@@ -222,6 +224,7 @@ class OpenAICompatibleProvider(WorkflowProvider):
             "generated_artifact": self._director_artifact_preview(context.get("artifact", {})),
             "conversation_history": self._compact_conversation_history(context.get("conversation_history", [])),
             "next_actions": self._sanitize_for_external(context.get("next_actions", [])),
+            "asset_candidates": self._sanitize_for_external(context.get("asset_candidates", [])),
         }
         payload = {
             "model": self.model,
@@ -326,6 +329,22 @@ class OpenAICompatibleProvider(WorkflowProvider):
         return compact
 
     @classmethod
+    def _compact_reference_items(cls, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        fields = (
+            "reference_key", "canonical_key", "source_kind", "source_id", "source_ids",
+            "status", "origin", "candidate_id", "input_candidate_ids", "library_asset_id",
+            "model", "url",
+        )
+        compact: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            compact.append({key: item.get(key) for key in fields if key in item})
+        return compact
+
+    @classmethod
     def _compact_asset_requirements(cls, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
@@ -363,13 +382,15 @@ class OpenAICompatibleProvider(WorkflowProvider):
             "continuity_rules", "adaptation_notes", "open_questions",
             "source_fact_register", "adaptation_decisions", "asset_requirements",
             "items", "manifest_validation", "shots", "checks", "blocking_failures", "status", "note",
-            "estimated_seconds", "url"
+            "estimated_seconds", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed"
         ):
             if key not in content:
                 continue
             value = content[key]
             if key == "items" and kind == "asset_manifest":
                 value = cls._compact_manifest_items(value)
+            elif key == "items" and kind == "reference_images":
+                value = cls._compact_reference_items(value)
             elif key == "asset_requirements":
                 value = cls._compact_asset_requirements(value)
             elif isinstance(value, list):

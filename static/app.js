@@ -16,6 +16,8 @@ const state = {
   pendingChat: null,
   candidateBases: {},
   batchSelections: {},
+  visualAssetDetail: null,
+  candidateRequestStatus: {},
 };
 
 let jobWatchTimer = null;
@@ -240,6 +242,7 @@ function renderArtifacts(artifacts) {
   bindStageResetButtons();
   bindArtifactFeedbackButtons();
   bindAssetCandidateUi();
+  bindVisualAssetOverviewUi();
 }
 
 function renderAgentContracts() {
@@ -269,7 +272,7 @@ function artifactCard(a) {
     : (["regenerate_current", "wait_for_user"].includes(reviewAction)
       ? `<span class="pill stale review-status-pill" title="总管复盘认为当前 revision 仍需处理。">总管待修</span>`
       : "");
-  const visualStageClass = ["characters", "scenes", "props"].includes(a.kind) ? " asset-workbench-card" : "";
+  const visualStageClass = ["characters", "scenes", "props", "reference_images"].includes(a.kind) ? " asset-workbench-card" : "";
   return `
     <article class="artifact-card ${a.status}${visualStageClass}">
       <div class="artifact-card-header">
@@ -280,7 +283,9 @@ function artifactCard(a) {
           ${a.kind !== "source" ? `<button class="mini-button" data-feedback-stage="${escapeHtml(a.kind)}">在对话流中调整</button><button class="mini-button reject stage-reset-button" data-reset-stage="${escapeHtml(a.kind)}">清理此节点</button>` : ""}
         </div>
       </div>
-      <div class="artifact-content">${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}${renderContent(a.content, a.kind)}</div>
+      <div class="artifact-content">${["characters", "scenes", "props", "reference_images"].includes(a.kind)
+        ? `${renderVisualAssetOverview(a.content, a.kind)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+        : `${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}${renderContent(a.content, a.kind)}`}</div>
     </article>
   `;
 }
@@ -448,7 +453,7 @@ function renderAssetManifest(content) {
 }
 
 function assetStageLabel(kind) {
-  return {characters: "角色", scenes: "场景", props: "道具"}[kind] || kind;
+  return {characters: "角色", scenes: "场景", props: "道具", reference_images: "参考图"}[kind] || kind;
 }
 
 function assetValue(value) {
@@ -475,6 +480,14 @@ function assetSpecRows(item, kind) {
     add("时间/天气", item.time_weather);
     add("成片连续性锁", item.production_continuity_lock || item.continuity_lock);
     add("扩展连续性备注", item.continuity);
+  } else if (kind === "reference_images") {
+    add("类型", item.source_kind);
+    add("绑定资产", item.source_ids || item.source_id);
+    add("状态", item.status);
+    add("模型", item.model);
+    add("生成提示", item.prompt);
+    add("上游候选 ID", item.candidate_id || item.input_candidate_ids);
+    add("Library Asset", item.library_asset_id);
   } else {
     add("描述", item.description || item.physical_description);
     add("材质/尺度", item.material_scale || item.material);
@@ -524,6 +537,31 @@ function selectedBatchKeys(kind) {
     .map(key => key.slice(prefix.length));
 }
 
+function candidateRequestKey(kind, canonicalKey) {
+  return `${kind}:${canonicalKey}`;
+}
+
+function candidateStatusHtml(kind, canonicalKey) {
+  const status = state.candidateRequestStatus[candidateRequestKey(kind, canonicalKey)];
+  if (!status?.text) return `<div class="candidate-request-status" data-candidate-status hidden></div>`;
+  return `<div class="candidate-request-status ${escapeHtml(status.type || "info")}" data-candidate-status>${escapeHtml(status.text)}</div>`;
+}
+
+function setCandidateRequestStatus(card, type, text) {
+  const stage = card?.dataset?.assetStage || "";
+  const canonicalKey = card?.dataset?.canonicalKey || "";
+  if (!stage || !canonicalKey) return;
+  const key = candidateRequestKey(stage, canonicalKey);
+  if (text) state.candidateRequestStatus[key] = {type, text};
+  else delete state.candidateRequestStatus[key];
+  const el = card.querySelector("[data-candidate-status]");
+  if (el) {
+    el.hidden = !text;
+    el.className = `candidate-request-status ${type || "info"}`;
+    el.textContent = text || "";
+  }
+}
+
 function renderAssetCandidate(candidate, baseCandidateId) {
   const isSelected = Boolean(candidate.selected);
   const isBase = candidate.id === baseCandidateId;
@@ -538,6 +576,196 @@ function renderAssetCandidate(candidate, baseCandidateId) {
       ${isSelected ? "" : `<button class="mini-button reject" data-delete-candidate="${escapeHtml(candidate.id)}">删除</button>`}
     </div>
   </div>`;
+}
+
+function preferredCandidateForAsset(kind, canonicalKey) {
+  const candidates = currentCandidatesForAsset(kind, canonicalKey);
+  return candidates.find(candidate => candidate.selected) || candidates[candidates.length - 1] || null;
+}
+
+function renderSingleAssetDetail(item, kind, idx = 0) {
+  const label = assetStageLabel(kind);
+  const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
+  const candidates = currentCandidatesForAsset(kind, canonicalKey);
+  const selected = candidates.find(c => c.selected);
+  const rememberedBase = state.candidateBases[`${kind}:${canonicalKey}`] || "";
+  const latest = candidates[candidates.length - 1];
+  const baseCandidateId = rememberedBase || selected?.id || latest?.id || "";
+  const rows = assetSpecRows(item, kind);
+  const candidateHtml = candidates.length
+    ? candidates.map(c => renderAssetCandidate(c, baseCandidateId)).join("")
+    : `<div class="candidate-empty">还没有视觉候选。先“抽 1 张”，满意后点“设为采用并锁定”；不满意就写局部要求再抽。</div>`;
+  return `<section class="asset-design-card detail-card" data-asset-stage="${escapeHtml(kind)}" data-canonical-key="${escapeHtml(canonicalKey)}">
+    <div class="asset-design-header">
+      <div><b>${escapeHtml(item.name || item.id || canonicalKey)}</b><div class="artifact-meta">${escapeHtml(canonicalKey)} · ${escapeHtml(kind === "reference_images" ? (item.source_kind || item.status || "reference") : (item.reuse_decision || item.decision || "CREATE"))}</div></div>
+      ${selected ? `<span class="pill ready">已锁定视觉</span>` : `<span class="pill">待选视觉</span>`}
+    </div>
+    ${kind === "reference_images"
+      ? `<div class="visual-localization-banner"><b>参考绑定</b><span>${escapeHtml(item.source_kind || "reference")}</span><span>${escapeHtml(assetValue(item.source_ids || item.source_id) || canonicalKey)}</span><span>调整只会生成新的参考候选，不会改写上游角色/场景/道具 Bible</span></div>`
+      : `<div class="visual-localization-banner"><b>视觉本地化</b><span>目标市场：${escapeHtml(item?.visual_localization?.target_market || state.detail?.workspace?.settings?.target_market || "未设置")}</span><span>Provider Prompt：English</span><span>${item.localized_visual_design && item.generation_prompt_en ? "显式本地化设计已就绪" : "当前产物缺少显式本地化字段；抽图时仍会由 Harness Prompt Compiler 强制做目标市场适配"}</span></div>`}
+    <div class="visual-detail-columns">
+      <div class="visual-detail-specs"><div class="asset-spec-grid">${rows.map(([k,v]) => `<div class="asset-spec-row"><strong>${escapeHtml(k)}</strong><span>${escapeHtml(v)}</span></div>`).join("")}</div></div>
+      <div class="visual-detail-candidates">
+        <div class="candidate-gallery">${candidateHtml}</div>
+        <div class="candidate-editor">
+          <textarea rows="3" data-candidate-feedback placeholder="只改这个${escapeHtml(label)}。例如：${kind === "characters" ? "脸更接近原片、年龄感更明显；保留身份与识别色，只调整服装和气质" : kind === "scenes" ? "保持同一栋法国住宅 DNA；只调整这个空间的材质、光线或构图" : kind === "reference_images" ? "保持所有已绑定 canonical asset 的身份、脸、服装、场景结构和道具形态，只调整构图、相对位置、镜头感或光线" : "保持道具身份和关键结构；只调整材质、旧化程度或尺度"}"></textarea>
+          ${candidateStatusHtml(kind, canonicalKey)}
+          <div class="candidate-editor-actions"><span class="artifact-meta">${baseCandidateId ? "默认基于当前采用/最近候选继续调整" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button></div>
+        </div>
+      </div>
+    </div>
+  </section>`;
+}
+
+function renderVisualAssetOverview(content, kind) {
+  const items = Array.isArray(content?.items) ? content.items : [];
+  const label = assetStageLabel(kind);
+  const artifact = currentArtifactForStage(kind);
+  const revision = Number(artifact?.revision || 0);
+  const withCandidate = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).length).length;
+  const selectedCount = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).some(c => c.selected)).length;
+  const tileRecords = items.map((item, idx) => {
+    const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
+    const candidate = preferredCandidateForAsset(kind, canonicalKey);
+    const batchSelected = isBatchSelected(kind, canonicalKey);
+    const status = candidate?.selected ? "已采用" : candidate ? "候选" : "待出图";
+    const sourceKind = String(item.source_kind || "");
+    const sourceIds = Array.isArray(item.source_ids) ? item.source_ids : (Array.isArray(item.source_id) ? item.source_id : []);
+    const isCombination = kind === "reference_images" && sourceKind === "combination";
+    const title = isCombination ? "关系组合参考" : (item.name || item.id || canonicalKey);
+    const subtitle = isCombination && sourceIds.length ? sourceIds.join(" + ") : canonicalKey;
+    const html = `<div class="asset-overview-tile ${batchSelected ? "batch-selected" : ""} ${isCombination ? "reference-combination-tile" : ""}" data-asset-stage="${escapeHtml(kind)}" data-canonical-key="${escapeHtml(canonicalKey)}">
+      <div class="asset-overview-image" data-open-visual-asset="${escapeHtml(canonicalKey)}">${candidate?.url ? renderMedia(candidate.url) : `<div class="asset-overview-empty"><span>＋</span><small>暂无候选</small></div>`}</div>
+      <div class="asset-overview-meta">
+        <div><b>${escapeHtml(title)}</b><div class="artifact-meta ${isCombination ? "reference-combination-binding" : ""}">${escapeHtml(subtitle)}</div></div>
+        <span class="pill ${candidate?.selected ? "ready" : ""}">${escapeHtml(status)}</span>
+      </div>
+      <div class="asset-overview-actions"><label class="batch-select-box"><input type="checkbox" data-batch-select ${batchSelected ? "checked" : ""}><span>加入批量</span></label><div class="asset-overview-action-buttons">${candidate ? (candidate.selected ? `<button class="mini-button ok" disabled>已采用</button>` : `<button class="mini-button ok" data-quick-select-candidate="${escapeHtml(candidate.id)}">确认采用</button>`) : ""}<button class="mini-button" data-open-visual-asset="${escapeHtml(canonicalKey)}">查看 / 调整</button></div></div>
+    </div>`;
+    return {html, sourceKind, isCombination};
+  });
+  const tiles = tileRecords.map(record => record.html).join("");
+  const batchSelectedKeys = selectedBatchKeys(kind);
+  const pendingQuickCandidates = items.map((item, idx) => {
+    const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
+    return preferredCandidateForAsset(kind, canonicalKey);
+  }).filter(candidate => candidate && !candidate.selected);
+  const active = state.visualAssetDetail && state.visualAssetDetail.stage === kind ? state.visualAssetDetail.key : "";
+  const activeIndex = items.findIndex((item, idx) => String(item.canonical_key || item.id || `asset-${idx+1}`) === active);
+  const modal = activeIndex >= 0 ? `<div class="visual-detail-overlay" data-visual-detail-overlay>
+    <div class="visual-detail-dialog" role="dialog" aria-modal="true">
+      <div class="visual-detail-header"><div><strong>${escapeHtml(label)}详情与候选调整</strong><div class="artifact-meta">点击右上角关闭即可回到缩略图总览，不需要上下滚动寻找其他资产。</div></div><button class="mini-button" data-close-visual-asset>关闭</button></div>
+      <div class="visual-detail-scroll">${renderSingleAssetDetail(items[activeIndex], kind, activeIndex)}</div>
+    </div>
+  </div>` : "";
+  const coverage = kind === "reference_images" ? (content?.selection_coverage || {}) : {};
+  const validation = kind === "reference_images" ? (content?.reference_validation || {}) : {};
+  const missingCombinations = kind === "reference_images" && Array.isArray(content?.missing_combinations) ? content.missing_combinations : [];
+  const validationStatus = String(validation?.status || "").toLowerCase();
+  const referenceDiagnostics = kind === "reference_images" ? `<div class="reference-diagnostics ${(missingCombinations.length || validationStatus === "fail") ? "blocking" : "ok"}"><strong>参考图绑定状态</strong><span>上游已采用：${Number(coverage.upstream_selected_count || 0)}</span><span>孤立参考：${Number(coverage.isolated_completed || 0)}/${Number(coverage.isolated_expected || 0)}</span><span>组合参考：${Number(coverage.combination_completed || 0)}/${Number(coverage.combination_expected || 0)}</span>${validationStatus ? `<span>Harness 校验：${escapeHtml(validationStatus)}</span>` : ""}${missingCombinations.length ? `<span>缺失组合：${missingCombinations.length}</span>` : `<span>组合完整</span>`}</div>` : "";
+  const referenceGallery = kind === "reference_images" ? (() => {
+    const isolated = tileRecords.filter(record => !record.isCombination).map(record => record.html).join("");
+    const combinations = tileRecords.filter(record => record.isCombination).map(record => record.html).join("");
+    const isolatedCount = tileRecords.filter(record => !record.isCombination).length;
+    const comboCount = tileRecords.filter(record => record.isCombination).length;
+    const isolatedOpen = Number(coverage.isolated_completed || 0) < Number(coverage.isolated_expected || 0);
+    return `<div class="reference-phase-stack">
+      <details class="reference-phase reference-phase-isolated" ${isolatedOpen ? "open" : ""}>
+        <summary><span><strong>Phase A · 基础参考</strong><small>角色 / 场景 / 道具的已锁定 production truth</small></span><span class="pill ${Number(coverage.isolated_completed || 0) === Number(coverage.isolated_expected || 0) ? "ready" : ""}">${isolatedCount} 项</span></summary>
+        <div class="asset-overview-gallery reference-phase-gallery">${isolated}</div>
+      </details>
+      <section class="reference-phase reference-phase-combinations">
+        <div class="reference-phase-header"><span><strong>Phase B · 关系组合</strong><small>供 storyboard 直接判断人物、空间与道具关系；优先检查和确认这里。</small></span><span class="pill ${validationStatus === "pass" && comboCount === Number(coverage.combination_expected || 0) ? "ready" : ""}">${comboCount}/${Number(coverage.combination_expected || comboCount)}</span></div>
+        <div class="asset-overview-gallery reference-phase-gallery">${combinations || `<div class="candidate-empty">当前没有关系组合参考。若已绑定组合要求，请先重新生成参考图。</div>`}</div>
+      </section>
+    </div>`;
+  })() : `<div class="asset-overview-gallery">${tiles}</div>`;
+  return `<div class="asset-visual-workbench compact-overview">
+    <div class="visual-workbench-toolbar"><div><strong>${escapeHtml(label)}视觉结果</strong><div class="artifact-meta">rev ${revision} · ${items.length} 项 · ${withCandidate} 项已有候选 · ${selectedCount} 项已采用。点击图片进入单项详情和调整；也可以直接在卡片上确认采用。</div></div><div class="overview-toolbar-actions">${pendingQuickCandidates.length ? `<button class="mini-button ok" data-quick-select-all-current="${escapeHtml(kind)}">一键确认所有当前候选（${pendingQuickCandidates.length}）</button>` : (withCandidate && selectedCount === withCandidate ? `<span class="pill ready">当前候选均已采用</span>` : "")}</div></div>
+    ${referenceDiagnostics}
+    ${referenceGallery}
+    <details class="batch-quick-panel" ${batchSelectedKeys.length ? "open" : ""} data-batch-workbench="${escapeHtml(kind)}">
+      <summary><span>批量要求与抽图</span><span class="pill amber" data-batch-count>${batchSelectedKeys.length} 项已勾选</span></summary>
+      <div class="batch-workbench-panel compact-batch">
+        <div class="batch-workbench-header"><div class="artifact-meta">统一要求会应用到勾选项，但每个${escapeHtml(label)}仍结合自己的 Bible / 本地化分析分别生成。</div><div class="batch-workbench-toolbar"><button class="mini-button" data-batch-select-all>全选</button><button class="mini-button" data-batch-clear>清空勾选</button></div></div>
+        <textarea data-batch-feedback placeholder="给勾选的${escapeHtml(label)}同样的要求。"></textarea>
+        <div class="batch-workbench-actions"><span class="artifact-meta">橘色按钮仅重抽视觉候选，不重跑 Kimi 结构化设计。</span><button class="mini-button batch" data-generate-batch="1">对勾选项各抽 1 张</button><button class="mini-button batch" data-generate-batch="4">对勾选项各抽 4 张</button></div>
+      </div>
+    </details>
+    ${modal}
+  </div>`;
+}
+
+async function quickSelectVisualCandidate(candidateId, button = null) {
+  if (!candidateId) return;
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/workspaces/${state.selectedId}/asset-candidates/${candidateId}/select`, {method:"POST"});
+    await refreshCurrent();
+    renderDetail();
+    toast("已确认采用并锁定");
+  } finally {
+    if (button && document.body.contains(button)) button.disabled = false;
+  }
+}
+
+async function quickSelectAllCurrentCandidates(kind, button = null) {
+  const artifact = currentArtifactForStage(kind);
+  const items = Array.isArray(artifact?.content?.items) ? artifact.content.items : [];
+  const pending = items.map((item, idx) => {
+    const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
+    return preferredCandidateForAsset(kind, canonicalKey);
+  }).filter(candidate => candidate && !candidate.selected);
+  if (!pending.length) { toast("当前没有待确认候选"); return; }
+  if (!window.confirm(`将把 ${pending.length} 张当前候选设为下游采用图并锁定。继续吗？`)) return;
+  if (button) button.disabled = true;
+  let success = 0;
+  const failures = [];
+  try {
+    for (const candidate of pending) {
+      try {
+        await api(`/api/workspaces/${state.selectedId}/asset-candidates/${candidate.id}/select`, {method:"POST"});
+        success += 1;
+      } catch (error) {
+        failures.push(error.message || String(error));
+      }
+    }
+    await refreshCurrent();
+    renderDetail();
+    toast(failures.length ? `已确认 ${success}/${pending.length} 项；${failures.length} 项失败` : `已确认采用 ${success} 项当前候选`);
+  } finally {
+    if (button && document.body.contains(button)) button.disabled = false;
+  }
+}
+
+function bindVisualAssetOverviewUi() {
+  document.querySelectorAll("[data-quick-select-candidate]").forEach(button => button.addEventListener("click", async event => {
+    event.preventDefault();
+    event.stopPropagation();
+    try { await quickSelectVisualCandidate(button.dataset.quickSelectCandidate || "", button); }
+    catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-quick-select-all-current]").forEach(button => button.addEventListener("click", async event => {
+    event.preventDefault();
+    try { await quickSelectAllCurrentCandidates(button.dataset.quickSelectAllCurrent || "", button); }
+    catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-open-visual-asset]").forEach(el => el.addEventListener("click", event => {
+    event.preventDefault();
+    const tile = el.closest("[data-asset-stage]");
+    if (!tile) return;
+    state.visualAssetDetail = {stage: tile.dataset.assetStage, key: tile.dataset.canonicalKey};
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-close-visual-asset]").forEach(el => el.addEventListener("click", () => {
+    state.visualAssetDetail = null;
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-visual-detail-overlay]").forEach(overlay => overlay.addEventListener("click", event => {
+    if (event.target !== overlay) return;
+    state.visualAssetDetail = null;
+    renderDetail();
+  }));
 }
 
 function renderAssetDesignWorkbench(content, kind) {
@@ -598,22 +826,42 @@ async function generateCandidateForCard(card, count = 1) {
   const baseCandidateId = state.candidateBases[key] || selected?.id || latest?.id || "";
   const buttons = card.querySelectorAll("[data-generate-candidate]");
   buttons.forEach(btn => btn.disabled = true);
+  setCandidateRequestStatus(card, "loading", `正在生成 ${count} 张候选，请稍候…`);
   try {
-    toast(`${assetStageLabel(stage)} ${canonicalKey} 正在抽图…`);
+    toast(`${assetStageLabel(stage)} ${canonicalKey} 正在抽 ${count} 张…`);
     const result = await api(`/api/workspaces/${state.selectedId}/asset-candidates`, {
       method: "POST",
       body: JSON.stringify({stage, canonical_key: canonicalKey, feedback, base_candidate_id: baseCandidateId, count}),
     });
     const created = result.items || [];
     if (created.length) state.candidateBases[key] = created[created.length - 1].id;
+    const partial = result.status === "partial" || created.length < Number(result.requested_count || count);
+    state.candidateRequestStatus[key] = partial
+      ? {type:"warning", text:`已生成 ${created.length}/${result.requested_count || count} 张；后续请求失败：${result.error || "请检查 Provider"}`}
+      : {type:"success", text:`已生成 ${created.length} 张候选。`};
     await refreshCurrent();
     state.tab = stage;
     renderDetail();
-    toast(`已生成 ${created.length} 张候选`);
+    toast(partial ? `已生成 ${created.length}/${result.requested_count || count} 张候选` : `已生成 ${created.length} 张候选`);
+    return result;
+  } catch (error) {
+    state.candidateRequestStatus[key] = {type:"error", text:`生成失败：${error.message || error}`};
+    // A previous request in a multi-image run may already have been saved. Refresh
+    // even on error so successful candidates never remain invisible until reload.
+    try {
+      await refreshCurrent();
+      state.tab = stage;
+      renderDetail();
+    } catch (refreshError) {
+      console.warn("candidate refresh after error failed", refreshError);
+      setCandidateRequestStatus(card, "error", `生成失败：${error.message || error}`);
+    }
+    throw error;
   } finally {
     buttons.forEach(btn => btn.disabled = false);
   }
 }
+
 
 async function generateBatchCandidates(kind, canonicalKeys, feedback, count = 1, button = null) {
   if (!canonicalKeys.length) { toast("请先勾选至少一个资产"); return; }

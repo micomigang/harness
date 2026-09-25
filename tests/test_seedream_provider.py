@@ -90,7 +90,9 @@ def test_reference_image_honors_director_prompt_and_asset_cap(tmp_path: Path):
             ],
         },
     )
-    assert result["requested"] == 1
+    assert result["requested"] == 2
+    assert result["completed"] == 1
+    assert result["missing_isolated"] == ["b"]
     assert "Contemporary Paris" in posted[0]
 
 
@@ -249,3 +251,157 @@ def test_visual_prompt_compiler_localizes_scene_and_prop_for_france():
     )
     assert "Avoid Chinese/East-Asian mansion motifs" in scene_prompt
     assert "Use plausible French/European domestic object design" in prop_prompt
+
+
+def test_reference_stage_generates_explicit_multi_reference_combination(tmp_path: Path):
+    posted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            import json
+            posted.append(json.loads(request.content.decode()))
+            return httpx.Response(200, json={"data": [{"url": "https://files.example/combo.png"}]})
+        if str(request.url) == "https://files.example/combo.png":
+            return httpx.Response(200, content=b"combo")
+        return httpx.Response(404)
+
+    provider = SeedreamProvider(
+        api_key="test-key",
+        base_url="https://ark.example/api/v3",
+        model="doubao-seedream-5-0-pro-260628",
+        output_dir=tmp_path,
+        max_assets=1,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = provider.generate("reference_images", {
+        "workspace": {"id": "w"},
+        "user_instruction": "1. char_grandmere + scene_foyer + prop_mysterious_travel_bag",
+        "execution_directive": {"prompt_addendum": "Preserve exact identities."},
+        "artifacts": [
+            {"kind": "characters", "content": {"items": [{"id": "char_grandmere", "canonical_key": "char_grandmere", "name": "Grandmere"}]}},
+            {"kind": "scenes", "content": {"items": [{"id": "scene_foyer", "canonical_key": "scene_foyer", "name": "Foyer"}]}},
+            {"kind": "props", "content": {"items": [{"id": "prop_mysterious_travel_bag", "canonical_key": "prop_mysterious_travel_bag", "name": "Bag"}]}},
+        ],
+        "asset_candidates": [
+            {"id": "c1", "stage": "characters", "canonical_key": "char_grandmere", "selected": True, "remote_url": "https://files.example/grandmere.png", "url": "/media/grandmere.png"},
+            {"id": "c2", "stage": "scenes", "canonical_key": "scene_foyer", "selected": True, "remote_url": "https://files.example/foyer.png", "url": "/media/foyer.png"},
+            {"id": "c3", "stage": "props", "canonical_key": "prop_mysterious_travel_bag", "selected": True, "remote_url": "https://files.example/bag.png", "url": "/media/bag.png"},
+        ],
+    })
+
+    assert result["selection_coverage"]["upstream_selected_count"] == 3
+    assert result["selection_coverage"]["combination_completed"] == 1
+    combo = next(item for item in result["items"] if item["source_kind"] == "combination")
+    assert combo["source_id"] == ["char_grandmere", "scene_foyer", "prop_mysterious_travel_bag"]
+    assert len(posted) == 1
+    assert posted[0]["image"] == [
+        "https://files.example/grandmere.png",
+        "https://files.example/foyer.png",
+        "https://files.example/bag.png",
+    ]
+    assert "sequential_image_generation" not in posted[0]
+
+
+def test_reference_source_kinds_are_singular_for_upstream_adopted(tmp_path: Path):
+    provider = SeedreamProvider(
+        api_key="test-key",
+        base_url="https://ark.example/api/v3",
+        model="seedream",
+        output_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(lambda request: (_ for _ in ()).throw(AssertionError("no generation expected")))),
+    )
+    result = provider.generate("reference_images", {
+        "workspace": {"id": "w"},
+        "artifacts": [
+            {"kind": "characters", "content": {"items": [{"id": "char_a", "canonical_key": "char_a"}]}},
+            {"kind": "scenes", "content": {"items": [{"id": "scene_a", "canonical_key": "scene_a"}]}},
+            {"kind": "props", "content": {"items": [{"id": "prop_a", "canonical_key": "prop_a"}]}},
+        ],
+        "asset_candidates": [
+            {"id": "1", "stage": "characters", "canonical_key": "char_a", "selected": True, "url": "/a.png"},
+            {"id": "2", "stage": "scenes", "canonical_key": "scene_a", "selected": True, "url": "/b.png"},
+            {"id": "3", "stage": "props", "canonical_key": "prop_a", "selected": True, "url": "/c.png"},
+        ],
+    })
+    assert [item["source_kind"] for item in result["items"]] == ["character", "scene", "prop"]
+
+
+def test_combination_parser_ignores_category_rollups_and_director_style_summaries():
+    text = """
+Characters: char_grandmere, char_son, char_boy
+Scenes: scene_foyer, scene_salon
+Props: prop_bag, prop_cup
+1. char_grandmere + scene_foyer + prop_bag
+2. char_son + scene_foyer
+Example binding source_ids: [char_grandmere, scene_foyer, prop_bag]
+"""
+    assert SeedreamProvider._extract_reference_combinations(text) == [
+        ["char_grandmere", "scene_foyer", "prop_bag"],
+        ["char_son", "scene_foyer"],
+    ]
+
+
+def test_reference_validation_passes_for_selected_isolated_and_explicit_combinations(tmp_path: Path):
+    posted = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            import json
+            posted.append(json.loads(request.content.decode()))
+            idx = len(posted)
+            return httpx.Response(200, json={"data": [{"url": f"https://files.example/combo-{idx}.png"}]})
+        if str(request.url).startswith("https://files.example/combo-"):
+            return httpx.Response(200, content=b"combo")
+        return httpx.Response(404)
+
+    provider = SeedreamProvider(
+        api_key="test-key",
+        base_url="https://ark.example/api/v3",
+        model="seedream",
+        output_dir=tmp_path,
+        max_assets=1,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = provider.generate("reference_images", {
+        "workspace": {"id": "w"},
+        "user_instruction": "1. char_a + scene_a + prop_a\n2. char_b + scene_a",
+        "execution_directive": {
+            # Deliberately contains misleading multi-key prose. It must not create
+            # extra combinations because combination intent is user-owned.
+            "interpretation": "Characters char_a char_b and scenes scene_a scene_b and props prop_a prop_b",
+            "prompt_addendum": "Preserve exact identities.",
+        },
+        "artifacts": [
+            {"kind": "characters", "content": {"items": [
+                {"id": "char_a", "canonical_key": "char_a"},
+                {"id": "char_b", "canonical_key": "char_b"},
+            ]}},
+            {"kind": "scenes", "content": {"items": [
+                {"id": "scene_a", "canonical_key": "scene_a"},
+                {"id": "scene_b", "canonical_key": "scene_b"},
+            ]}},
+            {"kind": "props", "content": {"items": [
+                {"id": "prop_a", "canonical_key": "prop_a"},
+                {"id": "prop_b", "canonical_key": "prop_b"},
+            ]}},
+        ],
+        "asset_candidates": [
+            {"id": "c1", "stage": "characters", "canonical_key": "char_a", "selected": True, "remote_url": "https://files.example/char-a.png", "url": "/char-a.png"},
+            {"id": "c2", "stage": "characters", "canonical_key": "char_b", "selected": True, "remote_url": "https://files.example/char-b.png", "url": "/char-b.png"},
+            {"id": "s1", "stage": "scenes", "canonical_key": "scene_a", "selected": True, "remote_url": "https://files.example/scene-a.png", "url": "/scene-a.png"},
+            {"id": "s2", "stage": "scenes", "canonical_key": "scene_b", "selected": True, "remote_url": "https://files.example/scene-b.png", "url": "/scene-b.png"},
+            {"id": "p1", "stage": "props", "canonical_key": "prop_a", "selected": True, "remote_url": "https://files.example/prop-a.png", "url": "/prop-a.png"},
+            {"id": "p2", "stage": "props", "canonical_key": "prop_b", "selected": True, "remote_url": "https://files.example/prop-b.png", "url": "/prop-b.png"},
+        ],
+    })
+
+    assert result["selection_coverage"]["isolated_completed"] == 6
+    assert result["selection_coverage"]["combination_completed"] == 2
+    assert result["reference_plan"]["combinations"] == [
+        ["char_a", "scene_a", "prop_a"],
+        ["char_b", "scene_a"],
+    ]
+    assert result["reference_validation"]["status"] == "pass"
+    assert result["reference_validation"]["unexpected_combinations"] == []
+    assert result["completed"] == 8
+    assert len(posted) == 2

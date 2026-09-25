@@ -177,11 +177,7 @@ class Orchestrator:
                 24,
                 "总管已生成执行指令" + (f"：{summary[:100]}" if summary else ""),
             )
-        artifact_revisions = {str(item.get("kind") or ""): int(item.get("revision") or 0) for item in artifacts}
-        selected_candidates = [
-            candidate for candidate in self.db.list_asset_candidates(workspace_id, selected_only=True)
-            if int(candidate.get("artifact_revision") or 0) == artifact_revisions.get(str(candidate.get("stage") or ""), -1)
-        ]
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(workspace_id, artifacts)
         runtime_context = {
             "workspace": workspace,
             "artifacts": artifacts,
@@ -224,6 +220,8 @@ class Orchestrator:
             provider.name,
             upstream=REQUIRES.get(stage, []),
         )
+        if stage == "reference_images":
+            self._sync_reference_image_candidates(workspace_id, result)
         self.db.update_workspace(workspace_id, stage=stage, status="active")
         if progress_callback:
             progress_callback(96, "总管正在复盘本阶段生成结果")
@@ -239,6 +237,41 @@ class Orchestrator:
         if progress_callback:
             progress_callback(99, "总管复盘完成，正在结束任务")
         return result
+
+    def _sync_reference_image_candidates(self, workspace_id: str, artifact: dict[str, Any]) -> None:
+        revision = int(artifact.get("revision") or 0)
+        items = (artifact.get("content") or {}).get("items") or []
+        existing = self.db.list_asset_candidates(
+            workspace_id, stage="reference_images", artifact_revision=revision, limit=2000
+        )
+        existing_keys = {str(item.get("canonical_key") or "") for item in existing}
+        for index, item in enumerate(items if isinstance(items, list) else []):
+            if not isinstance(item, dict) or not item.get("url"):
+                continue
+            canonical_key = str(
+                item.get("canonical_key")
+                or item.get("reference_key")
+                or f"reference_{index + 1:03d}"
+            )
+            if canonical_key in existing_keys:
+                continue
+            auto_selected = str(item.get("status") or "").lower() in {
+                "selected_candidate", "upstream_adopted", "reused", "selected", "locked"
+            }
+            self.db.add_asset_candidate(
+                workspace_id,
+                "reference_images",
+                revision,
+                canonical_key,
+                str(item.get("source_id") or canonical_key),
+                feedback="",
+                prompt=str(item.get("prompt") or ""),
+                model=str(item.get("model") or ""),
+                remote_url=str(item.get("remote_url") or ""),
+                url=str(item.get("url") or ""),
+                local_path=str(item.get("local_path") or ""),
+                selected=auto_selected,
+            )
 
     def execute_job(self, job_id: str) -> None:
         job = self.db.get_job(job_id)
@@ -287,6 +320,21 @@ class Orchestrator:
                 ),
             )
 
+    def _selected_asset_candidates_for_current_artifacts(
+        self, workspace_id: str, artifacts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        revisions = {
+            str(item.get("kind") or ""): int(item.get("revision") or 0)
+            for item in artifacts
+            if isinstance(item, dict)
+        }
+        return [
+            candidate
+            for candidate in self.db.list_asset_candidates(workspace_id, selected_only=True, limit=1000)
+            if int(candidate.get("artifact_revision") or 0)
+            == revisions.get(str(candidate.get("stage") or ""), -1)
+        ]
+
     def plan_stage(
         self,
         workspace_id: str,
@@ -305,9 +353,11 @@ class Orchestrator:
         ).strip()
         memory = self.db.get_workspace_memory(workspace_id)
         provider = self.providers.workflow()
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(workspace_id, artifacts)
         fingerprint = self._guidance_fingerprint(
             workspace, artifacts, stage, instruction, memory,
-            self.db.workspace_asset_context(workspace_id)
+            self.db.workspace_asset_context(workspace_id),
+            selected_candidates,
         )
         if (
             not force
@@ -333,6 +383,7 @@ class Orchestrator:
             existing_instruction=str(saved.get("user_instruction") or ""),
             conversation_history=self.db.list_guidance_messages(workspace_id, limit=20),
             asset_library_context=self.db.workspace_asset_context(workspace_id),
+            asset_candidates=selected_candidates,
         )
         self.db.upsert_stage_guidance(
             workspace_id,
@@ -391,9 +442,11 @@ class Orchestrator:
         project_memory: str,
         saved_guidance: dict[str, Any],
     ) -> dict[str, Any]:
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(workspace["id"], artifacts)
         fingerprint = self._guidance_fingerprint(
             workspace, artifacts, stage, user_instruction, project_memory,
-            self.db.workspace_asset_context(workspace["id"])
+            self.db.workspace_asset_context(workspace["id"]),
+            selected_candidates,
         )
         if (
             saved_guidance.get("plan_input_hash") == fingerprint
@@ -414,6 +467,7 @@ class Orchestrator:
             existing_instruction=str(saved_guidance.get("user_instruction") or ""),
             conversation_history=self.db.list_guidance_messages(workspace["id"], limit=20),
             asset_library_context=self.db.workspace_asset_context(workspace["id"]),
+            asset_candidates=selected_candidates,
         )
         self.db.upsert_stage_guidance(
             workspace["id"],
@@ -618,6 +672,7 @@ class Orchestrator:
         existing_instruction: str = "",
         conversation_history: list[dict[str, Any]] | None = None,
         asset_library_context: list[dict[str, Any]] | None = None,
+        asset_candidates: list[dict[str, Any]] | None = None,
         interaction_mode: str = "conversation",
     ) -> dict[str, Any]:
         planner = getattr(provider, "llm", provider)
@@ -630,6 +685,7 @@ class Orchestrator:
             "existing_instruction": existing_instruction,
             "conversation_history": conversation_history or [],
             "asset_library_context": asset_library_context or [],
+            "asset_candidates": asset_candidates or [],
             "interaction_mode": interaction_mode,
         }
         planner_warning = ""
@@ -673,6 +729,7 @@ class Orchestrator:
         user_instruction: str,
         project_memory: str,
         asset_library_context: list[dict[str, Any]] | None = None,
+        asset_candidates: list[dict[str, Any]] | None = None,
     ) -> str:
         payload = {
             "stage": stage,
@@ -686,6 +743,16 @@ class Orchestrator:
             "asset_libraries": [
                 {"id": item.get("id"), "updated_at": item.get("updated_at"), "items": len(item.get("items", []))}
                 for item in (asset_library_context or [])
+            ],
+            "selected_asset_candidates": [
+                {
+                    "id": item.get("id"),
+                    "stage": item.get("stage"),
+                    "artifact_revision": item.get("artifact_revision"),
+                    "canonical_key": item.get("canonical_key"),
+                    "updated_at": item.get("updated_at"),
+                }
+                for item in (asset_candidates or [])
             ],
             "upstream_revisions": [
                 {
@@ -714,6 +781,7 @@ class Orchestrator:
         memory = self.db.get_workspace_memory(workspace_id)
         history = self.db.list_guidance_messages(workspace_id, limit=24)
         provider = self.providers.workflow()
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(workspace_id, artifacts)
         plan = self._call_director(
             provider=provider,
             workspace=workspace,
@@ -724,6 +792,7 @@ class Orchestrator:
             existing_instruction=str(saved.get("user_instruction") or ""),
             conversation_history=history,
             asset_library_context=self.db.workspace_asset_context(workspace_id),
+            asset_candidates=selected_candidates,
             interaction_mode=interaction_mode,
         )
         effective = str(
@@ -734,7 +803,8 @@ class Orchestrator:
         plan["effective_instruction"] = effective
         fingerprint = self._guidance_fingerprint(
             workspace, artifacts, stage, effective, memory,
-            self.db.workspace_asset_context(workspace_id)
+            self.db.workspace_asset_context(workspace_id),
+            selected_candidates,
         )
         self.db.upsert_stage_guidance(
             workspace_id,
@@ -1016,6 +1086,66 @@ class Orchestrator:
         }
         return guarded
 
+    @staticmethod
+    def _guard_reference_images_review(
+        review: dict[str, Any], artifact: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Keep reference-image review subordinate to deterministic coverage validation.
+
+        The reviewer receives a compact artifact preview and must not manufacture a
+        missing-item loop when the provider's complete deterministic validation has
+        already passed.  This is intentionally project-agnostic: no character names,
+        episode counts or specific combinations are hard-coded here.
+        """
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else None
+        validation = content.get("reference_validation") if isinstance(content, dict) else None
+        if not isinstance(validation, dict) or str(validation.get("status") or "").lower() != "pass":
+            return guarded
+
+        structural_markers = (
+            "source_kind", "source_id", "source_ids", "selected_candidate", "upstream_adopted",
+            "reference_validation", "selection_coverage", "isolated_completed", "isolated_expected",
+            "combination_completed", "combination_expected", "missing_planned_combinations",
+            "unexpected_combinations", "duplicate_reference_keys", "invalid_source_kinds",
+            "items total", "total items", "item count", "items 数量", "schema", "结构性缺失",
+        )
+        deviations = guarded.get("deviations")
+        if not isinstance(deviations, list):
+            deviations = []
+        kept: list[Any] = []
+        suppressed: list[Any] = []
+        for deviation in deviations:
+            try:
+                blob = json.dumps(deviation, ensure_ascii=False).casefold()
+            except TypeError:
+                blob = str(deviation).casefold()
+            if any(marker.casefold() in blob for marker in structural_markers):
+                suppressed.append(deviation)
+            else:
+                kept.append(deviation)
+        guarded["deviations"] = kept
+
+        if suppressed and not kept:
+            guarded["recommended_action"] = "proceed"
+            guarded["assessment"] = (
+                "Harness deterministic reference-image validation passed; reviewer-only "
+                "coverage/schema deviations were suppressed."
+            )
+            guarded["reply"] = (
+                "参考图已通过 Harness 的确定性覆盖与绑定校验。总管复盘中与实际完整产物冲突的"
+                "缺失项/数量/绑定结构判断已被抑制；可以继续进行视觉确认。"
+            )
+            guarded["suggested_adjustments"] = []
+
+        guarded["harness_review_guard"] = {
+            "reference_validation_status": "pass",
+            "structural_authority": "artifact.content.reference_validation",
+            "suppressed_structural_deviations": suppressed,
+            "remaining_nonstructural_deviations": kept,
+        }
+        return guarded
+
     def _post_generation_review(
         self,
         *,
@@ -1038,6 +1168,9 @@ class Orchestrator:
             "artifact": artifact,
             "conversation_history": recent,
             "next_actions": self.next_actions(workspace["id"]),
+            "asset_candidates": self._selected_asset_candidates_for_current_artifacts(
+                workspace["id"], self.db.list_artifacts(workspace["id"])
+            ),
         }
         review: dict[str, Any] = {}
         if callable(review_method):
@@ -1049,6 +1182,8 @@ class Orchestrator:
                 review = {"warning": str(exc)}
         if stage == "asset_manifest" and review:
             review = self._guard_asset_manifest_review(review, artifact, execution_directive)
+        elif stage == "reference_images" and review:
+            review = self._guard_reference_images_review(review, artifact)
         reply = str(review.get("reply") or "").strip()
         if not reply:
             next_actions = context["next_actions"]

@@ -47,3 +47,8 @@ generated/
 # Local FFmpeg binaries
 tools/ffmpeg-release/
 tools/ffmpeg-release-essentials.zip
+# Local runtime data
+data/
+
+# Local multimodal datasets
+多模态数据目标识别/

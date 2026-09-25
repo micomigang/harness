@@ -106,7 +106,7 @@ class StageRegenerationRequest(BaseModel):
 
 
 class AssetCandidateGenerateRequest(BaseModel):
-    stage: Literal["characters", "scenes", "props"]
+    stage: Literal["characters", "scenes", "props", "reference_images"]
     canonical_key: str = Field(min_length=1, max_length=240)
     feedback: str = Field(default="", max_length=4000)
     base_candidate_id: str = Field(default="", max_length=128)
@@ -114,7 +114,7 @@ class AssetCandidateGenerateRequest(BaseModel):
 
 
 class AssetCandidateBatchGenerateRequest(BaseModel):
-    stage: Literal["characters", "scenes", "props"]
+    stage: Literal["characters", "scenes", "props", "reference_images"]
     canonical_keys: list[str] = Field(min_length=1, max_length=200)
     feedback: str = Field(default="", max_length=4000)
     count: int = Field(default=1, ge=1, le=4)
@@ -554,8 +554,8 @@ def import_artifact_assets(workspace_id: str, library_id: str, kind: str) -> dic
 
 
 def _current_stage_asset(workspace_id: str, stage: str, canonical_key: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    if stage not in {"characters", "scenes", "props"}:
-        raise HTTPException(400, "Visual candidate workbench only supports characters/scenes/props")
+    if stage not in {"characters", "scenes", "props", "reference_images"}:
+        raise HTTPException(400, "Visual candidate workbench only supports characters/scenes/props/reference_images")
     artifact = db.get_artifact(workspace_id, stage)
     if not artifact or artifact.get("status") != "ready":
         raise HTTPException(409, f"{STAGE_LABELS.get(stage, stage)} artifact is not ready")
@@ -594,6 +594,18 @@ def _current_stage_asset_candidates_base(workspace_id: str, stage: str, canonica
     return base
 
 
+def _reference_artifact_base(item: dict[str, Any]) -> dict[str, Any] | None:
+    if not item.get("url"):
+        return None
+    return {
+        "id": "",
+        "remote_url": str(item.get("remote_url") or ""),
+        "url": str(item.get("url") or ""),
+        "local_path": str(item.get("local_path") or ""),
+        "model": str(item.get("model") or ""),
+    }
+
+
 def _asset_candidate_localization_context(workspace_id: str) -> dict[str, Any]:
     workspace = db.get_workspace(workspace_id) or {}
     settings_json = workspace.get("settings") if isinstance(workspace.get("settings"), dict) else {}
@@ -619,13 +631,22 @@ def _generate_asset_candidate_images(
     count: int,
     base: dict[str, Any] | None,
     localization_context: dict[str, Any],
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    """Generate up to ``count`` candidate images and preserve partial success.
+
+    Image generation is intentionally one request per candidate.  A later request
+    can fail after earlier candidates were already downloaded and persisted.  Do
+    not throw those successful candidates away just because the final request
+    failed; return a partial result so the UI can show them immediately.
+    """
     workflow = orchestrator.providers.workflow()
     image_provider = getattr(workflow, "image", None)
     generate_method = getattr(image_provider, "generate_candidate", None)
     if not callable(generate_method):
         raise HTTPException(409, "当前 Provider 未配置可交互的 Seedream 图片生成能力")
+
     created: list[dict[str, Any]] = []
+    error = ""
     for _ in range(count):
         try:
             generated = generate_method(
@@ -638,7 +659,8 @@ def _generate_asset_candidate_images(
                 localization_context=localization_context,
             )
         except Exception as exc:
-            raise HTTPException(502, str(exc)) from exc
+            error = str(exc)
+            break
         created.append(
             db.add_asset_candidate(
                 workspace_id,
@@ -655,7 +677,15 @@ def _generate_asset_candidate_images(
                 local_path=str(generated.get("local_path") or ""),
             )
         )
-    return created
+
+    status = "succeeded" if len(created) == count else ("partial" if created else "failed")
+    return {
+        "items": created,
+        "requested_count": int(count),
+        "completed_count": len(created),
+        "status": status,
+        "error": error,
+    }
 
 
 @app.post("/api/workspaces/{workspace_id}/asset-candidates")
@@ -667,8 +697,10 @@ def generate_asset_candidates(
         raise HTTPException(404, "Workspace not found")
     artifact, item = _current_stage_asset(workspace_id, payload.stage, payload.canonical_key)
     base = _current_stage_asset_candidates_base(workspace_id, payload.stage, payload.canonical_key, artifact, payload.base_candidate_id)
+    if base is None and payload.stage == "reference_images":
+        base = _reference_artifact_base(item)
     localization_context = _asset_candidate_localization_context(workspace_id)
-    created = _generate_asset_candidate_images(
+    result = _generate_asset_candidate_images(
         workspace_id,
         payload.stage,
         artifact,
@@ -678,6 +710,9 @@ def generate_asset_candidates(
         base,
         localization_context,
     )
+    created = result["items"]
+    if not created and result.get("error"):
+        raise HTTPException(502, str(result["error"]))
     db.add_event(
         workspace_id,
         "asset_candidate.generated",
@@ -686,11 +721,17 @@ def generate_asset_candidates(
             "canonical_key": payload.canonical_key,
             "artifact_revision": int(artifact.get("revision") or 0),
             "count": len(created),
+            "requested_count": int(payload.count),
+            "status": result.get("status"),
             "base_candidate_id": str((base or {}).get("id") or ""),
             "has_feedback": bool(payload.feedback.strip()),
+            "error": str(result.get("error") or "")[:500],
         },
     )
-    return {"items": created, "artifact_revision": int(artifact.get("revision") or 0)}
+    return {
+        **result,
+        "artifact_revision": int(artifact.get("revision") or 0),
+    }
 
 
 @app.post("/api/workspaces/{workspace_id}/asset-candidates/batch")
@@ -717,7 +758,9 @@ def generate_asset_candidates_batch(
         artifact, item = _current_stage_asset(workspace_id, payload.stage, canonical_key)
         artifact_revision = int(artifact.get("revision") or artifact_revision or 0)
         base = _current_stage_asset_candidates_base(workspace_id, payload.stage, canonical_key, artifact, "")
-        created = _generate_asset_candidate_images(
+        if base is None and payload.stage == "reference_images":
+            base = _reference_artifact_base(item)
+        result = _generate_asset_candidate_images(
             workspace_id,
             payload.stage,
             artifact,
@@ -727,7 +770,7 @@ def generate_asset_candidates_batch(
             base,
             localization_context,
         )
-        items_by_key[canonical_key] = created
+        items_by_key[canonical_key] = result["items"]
     db.add_event(
         workspace_id,
         "asset_candidate.batch_generated",

@@ -175,3 +175,84 @@ def test_generate_asset_candidates_batch_applies_same_feedback_to_multiple_asset
     assert len(image.calls) == 2
     assert {call["item"]["canonical_key"] for call in image.calls} == {"char_grandmere", "char_son"}
     assert all(call["feedback"] == "all characters should look more French" for call in image.calls)
+
+
+def test_single_candidate_endpoint_preserves_partial_success(monkeypatch):
+    class FlakyImageProvider(FakeImageProvider):
+        def generate_candidate(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) >= 2:
+                raise RuntimeError("provider failed on second image")
+            return {
+                "prompt": "prompt-1",
+                "model": "seedream-test",
+                "remote_url": "https://example.test/1.png",
+                "url": "/media/ws/asset_candidates/1.png",
+                "local_path": "/tmp/1.png",
+            }
+
+    fake_db = FakeDB()
+    image = FlakyImageProvider()
+    monkeypatch.setattr(main_module, "db", fake_db)
+    monkeypatch.setattr(main_module, "orchestrator", FakeOrchestrator(image))
+
+    result = main_module.generate_asset_candidates(
+        "ws",
+        main_module.AssetCandidateGenerateRequest(
+            stage="characters",
+            canonical_key="char_grandmere",
+            feedback="small edit",
+            count=4,
+        ),
+    )
+
+    assert result["status"] == "partial"
+    assert result["requested_count"] == 4
+    assert result["completed_count"] == 1
+    assert len(result["items"]) == 1
+    assert "second image" in result["error"]
+
+
+def test_reference_image_candidate_uses_artifact_image_as_default_edit_base(monkeypatch):
+    class ReferenceDB(FakeDB):
+        def get_artifact(self, workspace_id, stage):
+            if stage == "script":
+                return {"kind": "script", "status": "ready", "revision": 1, "content": {}}
+            assert stage == "reference_images"
+            return {
+                "workspace_id": workspace_id,
+                "kind": stage,
+                "status": "ready",
+                "revision": 2,
+                "content": {"items": [{
+                    "id": "combo__char_grandmere__scene_foyer",
+                    "canonical_key": "combo__char_grandmere__scene_foyer",
+                    "name": "Grand-mère + foyer",
+                    "source_kind": "combination",
+                    "source_ids": ["char_grandmere", "scene_foyer"],
+                    "prompt": "Preserve both canonical assets exactly.",
+                    "remote_url": "https://example.test/reference.png",
+                    "url": "/media/ws/reference_images/reference.png",
+                    "local_path": "",
+                }]},
+            }
+
+    fake_db = ReferenceDB()
+    image = FakeImageProvider()
+    monkeypatch.setattr(main_module, "db", fake_db)
+    monkeypatch.setattr(main_module, "orchestrator", FakeOrchestrator(image))
+
+    result = main_module.generate_asset_candidates(
+        "ws",
+        main_module.AssetCandidateGenerateRequest(
+            stage="reference_images",
+            canonical_key="combo__char_grandmere__scene_foyer",
+            feedback="move the subjects slightly closer",
+            count=1,
+        ),
+    )
+
+    assert result["completed_count"] == 1
+    assert image.calls[0]["source_kind"] == "reference_images"
+    assert image.calls[0]["reference_url"] == "https://example.test/reference.png"
+    assert image.calls[0]["feedback"] == "move the subjects slightly closer"
