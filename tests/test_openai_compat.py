@@ -457,3 +457,190 @@ def test_director_asset_manifest_upstream_keeps_full_script_contract_and_current
     assert len(by_kind["asset_manifest"]["content"]["items"]) == 14
     assert by_kind["asset_manifest"]["content"]["items"][-1]["canonical_key"] == "KEY_014"
     assert by_kind["asset_manifest"]["content"]["manifest_validation"]["item_count"] == 14
+
+
+def test_director_storyboard_preview_keeps_complete_compact_shot_sequence():
+    shots = [
+        {
+            "index": i,
+            "duration_seconds": 8,
+            "story_beat": f"beat-{i}",
+            "asset_bindings": {
+                "characters": ["char_a"],
+                "scenes": ["scene_a"],
+                "props": [],
+                "reference_images": [
+                    {
+                        "canonical_key": "combo__char_a__scene_a",
+                        "candidate_id": f"candidate-{i}",
+                        "url": "https://example.invalid/very/long/url.jpg",
+                        "source_kind": "combination",
+                    }
+                ],
+            },
+            "visual_prompt": "x" * 1200,
+            "blocking": "keep axis",
+            "status": "planned",
+        }
+        for i in range(1, 15)
+    ]
+    preview = OpenAICompatibleProvider._director_artifact_preview(
+        {
+            "kind": "storyboard",
+            "revision": 1,
+            "status": "ready",
+            "content": {
+                "shots": shots,
+                "estimated_seconds": 112,
+                "storyboard_validation": {
+                    "status": "pass",
+                    "expected_shots": 14,
+                    "actual_shots": 14,
+                },
+            },
+        }
+    )
+    compact = preview["content"]["shots"]
+    assert len(compact) == 14
+    assert compact[-1]["index"] == 14
+    assert compact[-1]["asset_bindings"]["reference_images"][0]["url"] == "https://example.invalid/very/long/url.jpg"
+    assert len(compact[-1]["visual_prompt"]) <= 901
+    assert preview["content"]["storyboard_validation"]["actual_shots"] == 14
+
+
+def test_director_upstream_keeps_full_storyboard_and_reference_contracts():
+    storyboard_shots = [
+        {
+            "index": i,
+            "duration_seconds": 6,
+            "story_beat": f"beat-{i}",
+            "asset_bindings": {"scenes": ["scene_a"], "reference_images": []},
+            "visual_prompt": f"prompt-{i}",
+        }
+        for i in range(1, 15)
+    ]
+    reference_items = [
+        {
+            "canonical_key": f"ref_{i}",
+            "source_kind": "scene",
+            "source_id": f"scene_{i}",
+            "candidate_id": f"cand_{i}",
+            "url": f"/media/{i}.jpg",
+        }
+        for i in range(1, 22)
+    ]
+    context = {
+        "workspace": {"id": "w1"},
+        "artifacts": [
+            {"kind": "reference_images", "revision": 8, "status": "ready", "content": {"items": reference_items, "reference_validation": {"status": "pass"}}},
+            {"kind": "storyboard", "revision": 1, "status": "ready", "content": {"shots": storyboard_shots, "storyboard_validation": {"status": "pass"}}},
+        ],
+    }
+    upstream = OpenAICompatibleProvider._director_upstream_context("dialogue_plan", context)
+    by_kind = {item["kind"]: item for item in upstream}
+    assert len(by_kind["reference_images"]["content"]["items"]) == 21
+    assert len(by_kind["storyboard"]["content"]["shots"]) == 14
+    assert by_kind["storyboard"]["content"]["shots"][-1]["index"] == 14
+
+
+def test_dialogue_plan_preview_keeps_complete_item_sequence():
+    items = [
+        {
+            "shot_index": index,
+            "speaker_id": None if index in {2, 9, 14} else "char_a",
+            "dialogue_text": "" if index in {2, 9, 14} else f"line {index}",
+            "language": "fr",
+            "timing": {"start_seconds": 0.5, "end_seconds": 1.5},
+            "subtitle": "" if index in {2, 9, 14} else f"line {index}",
+            "lip_sync_target": index not in {2, 9, 14},
+            "status": "silent" if index in {2, 9, 14} else "dialogue",
+        }
+        for index in range(1, 15)
+    ]
+    preview = OpenAICompatibleProvider._director_artifact_preview(
+        {
+            "kind": "dialogue_plan",
+            "revision": 1,
+            "status": "ready",
+            "provider": "kimi",
+            "content": {"items": items, "dialogue_validation": {"status": "pass"}},
+        }
+    )
+    assert len(preview["content"]["items"]) == 14
+    assert preview["content"]["items"][-1]["shot_index"] == 14
+    assert preview["content"]["dialogue_validation"]["status"] == "pass"
+
+
+def test_sound_plan_preview_keeps_complete_item_sequence():
+    items = [
+        {
+            "shot_index": index,
+            "ambience": f"ambience-{index}",
+            "foley": [f"foley-{index}"],
+            "cues": [],
+            "ducking": {"enabled": index not in {2, 9, 14}},
+            "negative_audio": ["no music"],
+            "status": "planned",
+        }
+        for index in range(1, 15)
+    ]
+    preview = OpenAICompatibleProvider._director_artifact_preview(
+        {
+            "kind": "sound_plan",
+            "revision": 2,
+            "status": "ready",
+            "provider": "kimi",
+            "content": {"items": items, "sound_validation": {"status": "pass"}},
+        }
+    )
+    assert len(preview["content"]["items"]) == 14
+    assert preview["content"]["items"][-1]["shot_index"] == 14
+    assert preview["content"]["sound_validation"]["status"] == "pass"
+
+
+def test_review_preview_keeps_complete_checks_and_blockers():
+    checks = [
+        {
+            "name": f"check-{index}",
+            "status": "fail" if index in {1, 2} else ("warn" if index in {3, 4} else "pass"),
+            "evidence": f"evidence-{index}",
+            "owner": "storyboard_director" if index <= 2 else "continuity_qa",
+            "remediation": f"fix-{index}",
+        }
+        for index in range(1, 13)
+    ]
+    blockers = [
+        {"name": "blocker-1", "owner": "storyboard_director", "remediation": "fix binding"},
+        {"name": "blocker-2", "owner": "storyboard_director", "remediation": "fix prop binding"},
+    ]
+    preview = OpenAICompatibleProvider._director_artifact_preview(
+        {
+            "kind": "review",
+            "revision": 1,
+            "status": "ready",
+            "provider": "kimi",
+            "content": {"checks": checks, "blocking_failures": blockers},
+        }
+    )
+    assert len(preview["content"]["checks"]) == 12
+    assert preview["content"]["checks"][-1]["name"] == "check-12"
+    assert len(preview["content"]["blocking_failures"]) == 2
+
+
+def test_review_stage_upstream_keeps_full_sound_and_review_contracts():
+    sound_items = [
+        {"shot_index": index, "ambience": f"amb-{index}", "foley": [], "cues": [], "ducking": {}, "negative_audio": [], "status": "planned"}
+        for index in range(1, 15)
+    ]
+    checks = [{"name": f"check-{i}", "status": "pass", "evidence": f"e-{i}", "owner": "qa"} for i in range(1, 13)]
+    context = {
+        "workspace": {"id": "w1"},
+        "artifacts": [
+            {"kind": "sound_plan", "revision": 2, "status": "ready", "content": {"items": sound_items, "sound_validation": {"status": "pass"}}},
+            {"kind": "review", "revision": 1, "status": "ready", "content": {"checks": checks, "blocking_failures": []}},
+        ],
+    }
+    upstream = OpenAICompatibleProvider._director_upstream_context("preview", context)
+    by_kind = {item["kind"]: item for item in upstream}
+    assert len(by_kind["sound_plan"]["content"]["items"]) == 14
+    assert len(by_kind["review"]["content"]["checks"]) == 12

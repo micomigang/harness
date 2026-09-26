@@ -1,0 +1,7 @@
+1. Fully restart Harness and hard-refresh the browser.
+2. In a stage with an already confirmed Director plan, leave the composer empty.
+3. Click the purple Generate/Advance button.
+4. Expected: no duplicate Kimi confirmation turn is added; a queued/running job appears immediately.
+5. For reference_images, the existing selected upstream candidates must not cause a false "plan stale" 409.
+6. Type a genuinely new requirement in the composer and click the purple button.
+7. Expected: Kimi binds the new requirement once, then the job starts.

@@ -243,6 +243,9 @@ function renderArtifacts(artifacts) {
   bindArtifactFeedbackButtons();
   bindAssetCandidateUi();
   bindVisualAssetOverviewUi();
+  bindStoryboardUi();
+  bindDialoguePlanUi();
+  bindSoundPlanUi();
 }
 
 function renderAgentContracts() {
@@ -273,8 +276,12 @@ function artifactCard(a) {
       ? `<span class="pill stale review-status-pill" title="总管复盘认为当前 revision 仍需处理。">总管待修</span>`
       : "");
   const visualStageClass = ["characters", "scenes", "props", "reference_images"].includes(a.kind) ? " asset-workbench-card" : "";
+  const storyboardStageClass = a.kind === "storyboard" ? " storyboard-workbench-card" : "";
+  const dialogueStageClass = a.kind === "dialogue_plan" ? " dialogue-workbench-card" : "";
+  const soundStageClass = a.kind === "sound_plan" ? " sound-workbench-card" : "";
+  const reviewStageClass = a.kind === "review" ? " review-workbench-card" : "";
   return `
-    <article class="artifact-card ${a.status}${visualStageClass}">
+    <article class="artifact-card ${a.status}${visualStageClass}${storyboardStageClass}${dialogueStageClass}${soundStageClass}${reviewStageClass}">
       <div class="artifact-card-header">
         <div><strong>${escapeHtml(a.name)}</strong><div class="artifact-meta">${escapeHtml(agent?.name || "未分配 Agent")} · rev ${a.revision} · ${escapeHtml(a.provider)}</div></div>
         <div class="artifact-header-actions">
@@ -285,7 +292,15 @@ function artifactCard(a) {
       </div>
       <div class="artifact-content">${["characters", "scenes", "props", "reference_images"].includes(a.kind)
         ? `${renderVisualAssetOverview(a.content, a.kind)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
-        : `${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}${renderContent(a.content, a.kind)}`}</div>
+        : a.kind === "storyboard"
+          ? `${renderStoryboard(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+          : a.kind === "dialogue_plan"
+            ? `${renderDialoguePlan(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+            : a.kind === "sound_plan"
+              ? `${renderSoundPlan(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+              : a.kind === "review"
+                ? `${renderReview(a.content)}${renderReviewExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+                : `${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}${renderContent(a.content, a.kind)}`}</div>
     </article>
   `;
 }
@@ -391,6 +406,409 @@ function renderExecutionInfo(execution) {
     ${instruction ? `<div><strong>用户要求：</strong>${escapeHtml(instruction)}</div>` : ""}
     ${interpretation ? `<div><strong>总管理解：</strong>${escapeHtml(interpretation)}</div>` : ""}
     ${Object.keys(params).length ? `<div><strong>参数：</strong><code>${escapeHtml(JSON.stringify(params))}</code></div>` : ""}
+  </div>`;
+}
+
+function storyboardArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === null || value === undefined || value === "") return [];
+  return [value];
+}
+
+function storyboardRefLabel(ref) {
+  if (ref && typeof ref === "object") {
+    return String(ref.canonical_key || ref.reference_key || ref.source_id || ref.source_kind || "reference");
+  }
+  return String(ref || "reference");
+}
+
+function storyboardBindingGroup(label, values, extraClass = "") {
+  const items = storyboardArray(values).filter(value => value !== null && value !== undefined && String(value) !== "");
+  if (!items.length) return "";
+  return `<div class="storyboard-binding-group ${extraClass}"><span class="storyboard-binding-label">${escapeHtml(label)}</span><div class="storyboard-binding-chips">${items.map(value => `<span>${escapeHtml(typeof value === "object" ? storyboardRefLabel(value) : String(value))}</span>`).join("")}</div></div>`;
+}
+
+function renderStoryboard(content) {
+  const shots = Array.isArray(content?.shots) ? content.shots : [];
+  const validation = content?.storyboard_validation || {};
+  const validationStatus = String(validation.status || "");
+  const expected = Number(validation.expected_shots || shots.length || 0);
+  const duration = Number(content?.estimated_seconds ?? validation.duration_sum_seconds ?? 0);
+  const missing = Array.isArray(validation.missing_indices) ? validation.missing_indices : [];
+  const issues = [
+    ...(Array.isArray(validation.missing_required_fields) ? validation.missing_required_fields : []),
+    ...(Array.isArray(validation.reference_binding_gaps) ? validation.reference_binding_gaps : []),
+  ];
+  const summaryClass = validationStatus === "fail" ? "blocking" : "ok";
+  const cards = shots.map((shot, position) => {
+    const indexValue = shot?.index ?? position + 1;
+    const numericIndex = Number.parseInt(String(indexValue).replace(/\D/g, ""), 10);
+    const indexText = Number.isFinite(numericIndex) ? String(numericIndex).padStart(2, "0") : String(indexValue);
+    const bindings = shot?.asset_bindings && typeof shot.asset_bindings === "object" ? shot.asset_bindings : {};
+    const scenes = bindings.scenes ?? bindings.scene ?? [];
+    const refs = storyboardArray(bindings.reference_images);
+    const prompt = String(shot?.visual_prompt || "");
+    const blocking = String(shot?.blocking || "");
+    const camera = String(shot?.camera || "");
+    const beat = String(shot?.story_beat || "");
+    const durationSeconds = shot?.duration_seconds ?? "—";
+    return `<article class="storyboard-shot-card">
+      <div class="storyboard-shot-head">
+        <div><span class="storyboard-shot-index">SHOT ${escapeHtml(indexText)}</span><span class="storyboard-shot-duration">${escapeHtml(durationSeconds)}s</span></div>
+        <span class="pill ${shot?.status === "planned" ? "ready" : ""}">${escapeHtml(shot?.status || "planned")}</span>
+      </div>
+      <div class="storyboard-beat">${beat ? escapeHtml(beat) : '<span class="storyboard-missing">缺少 story_beat</span>'}</div>
+      <div class="storyboard-bindings">
+        ${storyboardBindingGroup("人物", bindings.characters)}
+        ${storyboardBindingGroup("场景", scenes)}
+        ${storyboardBindingGroup("道具", bindings.props)}
+        ${storyboardBindingGroup(`参考图 ${refs.length}`, refs, "references")}
+      </div>
+      <details class="storyboard-shot-details">
+        <summary>镜头细节 / Provider prompt</summary>
+        ${camera ? `<div><strong>Camera</strong><p>${escapeHtml(camera)}</p></div>` : ""}
+        ${blocking ? `<div><strong>Blocking</strong><p>${escapeHtml(blocking)}</p></div>` : ""}
+        <div><strong>Visual prompt</strong><p>${prompt ? escapeHtml(prompt) : '<span class="storyboard-missing">缺少 visual_prompt</span>'}</p></div>
+      </details>
+    </article>`;
+  }).join("");
+  return `<div class="storyboard-workbench">
+    <div class="storyboard-validation ${summaryClass}">
+      <div><strong>分镜结构</strong><span>镜头 ${shots.length}/${expected || shots.length}</span><span>总时长 ${escapeHtml(duration)}s</span>${validationStatus ? `<span>Harness 校验：${escapeHtml(validationStatus)}</span>` : ""}${missing.length ? `<span>缺失编号：${escapeHtml(missing.join(", "))}</span>` : ""}${issues.length ? `<span>结构问题：${issues.length}</span>` : ""}</div>
+      <button class="mini-button" data-revalidate-storyboard>重新校验当前分镜（不重生成）</button>
+    </div>
+    <div class="storyboard-grid">${cards || '<div class="empty-canvas">当前没有分镜镜头。</div>'}</div>
+  </div>`;
+}
+
+async function revalidateStoryboard(button = null) {
+  if (!state.selectedId) return;
+  if (button) button.disabled = true;
+  try {
+    toast("正在重新校验当前分镜，不会重新生成镜头…");
+    const result = await api(`/api/workspaces/${state.selectedId}/storyboard/revalidate`, {method: "POST"});
+    await refreshCurrent();
+    state.tab = "storyboard";
+    renderDetail();
+    const validation = result.storyboard_validation || {};
+    toast(`分镜校验完成：${validation.actual_shots ?? "?"}/${validation.expected_shots ?? "?"} · ${validation.status || "unknown"}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindStoryboardUi() {
+  document.querySelectorAll("[data-revalidate-storyboard]").forEach(button => button.addEventListener("click", () => {
+    revalidateStoryboard(button).catch(error => toast(error.message));
+  }));
+}
+
+function dialogueArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value === null || value === undefined || value === "") return [];
+  return [value];
+}
+
+function dialogueTextValue(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  try { return JSON.stringify(value); } catch (_) { return String(value); }
+}
+
+function dialogueTimingLabel(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (typeof value === "object") {
+    const start = value.start_seconds ?? value.start ?? value.local_start_seconds ?? value.shot_start_seconds;
+    const end = value.end_seconds ?? value.end ?? value.local_end_seconds ?? value.shot_end_seconds;
+    const globalStart = value.timeline_start_seconds ?? value.global_start_seconds ?? value.absolute_start_seconds;
+    const globalEnd = value.timeline_end_seconds ?? value.global_end_seconds ?? value.absolute_end_seconds;
+    const local = start !== undefined || end !== undefined ? `${start ?? "?"}s → ${end ?? "?"}s` : "";
+    const global = globalStart !== undefined || globalEnd !== undefined ? `累计 ${globalStart ?? "?"}s → ${globalEnd ?? "?"}s` : "";
+    if (local || global) return [local, global].filter(Boolean).join(" · ");
+    return dialogueTextValue(value);
+  }
+  return String(value);
+}
+
+function dialogueLinesForItem(item) {
+  const nested = Array.isArray(item?.lines) ? item.lines
+    : Array.isArray(item?.dialogue_lines) ? item.dialogue_lines
+      : Array.isArray(item?.dialogue) ? item.dialogue : [];
+  if (nested.length) return nested.map(line => {
+    if (typeof line === "string") return {text: line, speaker_id: item?.speaker_id || ""};
+    return line && typeof line === "object" ? line : {text: String(line || "")};
+  });
+  const rawDialogue = typeof item?.dialogue === "string" ? item.dialogue : "";
+  const text = item?.dialogue_text ?? item?.text ?? rawDialogue;
+  if (text === null || text === undefined || String(text).trim() === "") return [];
+  return [{
+    speaker_id: item?.speaker_id,
+    text,
+    language: item?.language,
+    delivery_note: item?.delivery_note ?? item?.delivery,
+    timing: item?.timing,
+    subtitle: item?.subtitle,
+    lip_sync_target: item?.lip_sync_target ?? item?.lip_sync,
+  }];
+}
+
+function dialogueLipLabel(value) {
+  if (value === true) return "启用";
+  if (value === false || value === null) return "关闭";
+  if (value === undefined || value === "") return "—";
+  if (typeof value === "object") {
+    const target = value.target ?? value.enabled ?? value.mode ?? value.status;
+    return target !== undefined ? dialogueTextValue(target) : dialogueTextValue(value);
+  }
+  return dialogueTextValue(value);
+}
+
+function renderDialoguePlan(content) {
+  const items = Array.isArray(content?.items) ? content.items : [];
+  const validation = content?.dialogue_validation || {};
+  const expected = Number(validation.expected_items || items.length || 0);
+  const actual = Number(validation.actual_items ?? items.length);
+  const missing = Array.isArray(validation.missing_indices) ? validation.missing_indices : [];
+  const structuralIssues = [
+    ...(Array.isArray(validation.missing_required_fields) ? validation.missing_required_fields : []),
+    ...(Array.isArray(validation.timing_issues) ? validation.timing_issues : []),
+  ];
+  let dialogueCount = Number(validation.dialogue_items ?? 0);
+  let silentCount = Number(validation.silent_items ?? 0);
+  if (!validation.dialogue_items && !validation.silent_items && items.length) {
+    dialogueCount = items.filter(item => !["silent", "no_dialogue", "no-dialogue"].includes(String(item?.status || "").toLowerCase())).length;
+    silentCount = items.length - dialogueCount;
+  }
+  const validationStatus = String(validation.status || "");
+  const summaryClass = validationStatus === "fail" ? "blocking" : "ok";
+
+  const cards = items.map((item, position) => {
+    const rawIndex = item?.shot_index ?? position + 1;
+    const numericIndex = Number.parseInt(String(rawIndex).replace(/\D/g, ""), 10);
+    const indexText = Number.isFinite(numericIndex) ? String(numericIndex).padStart(2, "0") : String(rawIndex);
+    const status = String(item?.status || "dialogue").toLowerCase();
+    const silent = ["silent", "no_dialogue", "no-dialogue"].includes(status) || item?.no_dialogue === true;
+    const lines = dialogueLinesForItem(item);
+    const speaker = item?.speaker_id || (lines[0] && lines[0].speaker_id) || "";
+    const language = item?.language || (lines[0] && lines[0].language) || "";
+    const delivery = item?.delivery_note ?? item?.delivery ?? (lines[0] && (lines[0].delivery_note ?? lines[0].delivery)) ?? "";
+    const timing = item?.timing ?? (lines[0] && lines[0].timing);
+    const subtitle = item?.subtitle ?? (lines[0] && lines[0].subtitle) ?? "";
+    const lipSync = item?.lip_sync_target ?? item?.lip_sync ?? (lines[0] && (lines[0].lip_sync_target ?? lines[0].lip_sync));
+    const linesHtml = silent
+      ? `<div class="dialogue-silent-panel"><strong>NO DIALOGUE</strong><span>纯视觉镜头 · Lip sync 关闭</span></div>`
+      : `<div class="dialogue-lines">${lines.length ? lines.map((line, lineIndex) => {
+          const lineSpeaker = line?.speaker_id || speaker || "speaker";
+          const lineText = line?.dialogue_text ?? line?.text ?? line?.dialogue ?? "";
+          const lineTiming = line?.timing;
+          const lineDelivery = line?.delivery_note ?? line?.delivery ?? "";
+          return `<div class="dialogue-line-card"><div class="dialogue-line-meta"><strong>${escapeHtml(lineSpeaker)}</strong>${lineTiming ? `<span>${escapeHtml(dialogueTimingLabel(lineTiming))}</span>` : ""}</div><div class="dialogue-line-text">${escapeHtml(dialogueTextValue(lineText))}</div>${lineDelivery ? `<div class="dialogue-delivery">${escapeHtml(dialogueTextValue(lineDelivery))}</div>` : ""}</div>`;
+        }).join("") : `<div class="dialogue-missing">该镜标记为对白，但没有可显示的 dialogue_text / lines。</div>`}</div>`;
+    return `<article class="dialogue-shot-card ${silent ? "silent" : "speaking"}">
+      <div class="dialogue-shot-head">
+        <div><span class="dialogue-shot-index">SHOT ${escapeHtml(indexText)}</span>${language ? `<span class="dialogue-language">${escapeHtml(language)}</span>` : ""}</div>
+        <span class="pill ${silent ? "" : "ready"}">${escapeHtml(silent ? "NO DIALOGUE" : status || "dialogue")}</span>
+      </div>
+      ${linesHtml}
+      <div class="dialogue-facts">
+        <div><span>主 Speaker</span><b>${escapeHtml(speaker || (silent ? "—" : "未标注"))}</b></div>
+        <div><span>Timing</span><b>${escapeHtml(dialogueTimingLabel(timing))}</b></div>
+        <div><span>Lip Sync</span><b>${escapeHtml(dialogueLipLabel(lipSync))}</b></div>
+      </div>
+      ${delivery ? `<div class="dialogue-note"><span>语气 / Delivery</span><p>${escapeHtml(dialogueTextValue(delivery))}</p></div>` : ""}
+      ${subtitle ? `<details class="dialogue-details"><summary>字幕与结构详情</summary><div><strong>Subtitle</strong><p>${escapeHtml(dialogueTextValue(subtitle))}</p></div><pre>${escapeHtml(JSON.stringify({timing: item?.timing, lip_sync_target: item?.lip_sync_target, lip_sync: item?.lip_sync}, null, 2))}</pre></details>` : ""}
+    </article>`;
+  }).join("");
+
+  return `<div class="dialogue-workbench">
+    <div class="dialogue-validation ${summaryClass}">
+      <div><strong>对白与口型结构</strong><span>镜头覆盖 ${actual}/${expected || actual}</span><span>有对白 ${dialogueCount}</span><span>无对白 ${silentCount}</span>${validationStatus ? `<span>Harness 校验：${escapeHtml(validationStatus)}</span>` : ""}${missing.length ? `<span>缺失：${escapeHtml(missing.join(", "))}</span>` : ""}${structuralIssues.length ? `<span>结构问题：${structuralIssues.length}</span>` : ""}</div>
+      <button class="mini-button" data-revalidate-dialogue>重新校验当前对白（不重生成）</button>
+    </div>
+    <div class="dialogue-grid">${cards || '<div class="empty-canvas">当前没有对白与口型条目。</div>'}</div>
+  </div>`;
+}
+
+async function revalidateDialoguePlan(button = null) {
+  if (!state.selectedId) return;
+  if (button) button.disabled = true;
+  try {
+    toast("正在重新校验当前对白与口型，不会重新生成台词…");
+    const result = await api(`/api/workspaces/${state.selectedId}/dialogue-plan/revalidate`, {method: "POST"});
+    await refreshCurrent();
+    state.tab = "dialogue_plan";
+    renderDetail();
+    const validation = result.dialogue_validation || {};
+    toast(`对白校验完成：${validation.actual_items ?? "?"}/${validation.expected_items ?? "?"} · ${validation.status || "unknown"}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindDialoguePlanUi() {
+  document.querySelectorAll("[data-revalidate-dialogue]").forEach(button => button.addEventListener("click", () => {
+    revalidateDialoguePlan(button).catch(error => toast(error.message));
+  }));
+}
+
+function soundTextValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(soundTextValue).filter(x => x && x !== "—").join("；") || "—";
+  if (typeof value === "object") {
+    const preferred = value.text ?? value.description ?? value.note ?? value.label ?? value.name;
+    if (preferred !== undefined) return soundTextValue(preferred);
+    try { return JSON.stringify(value); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+
+function soundListHtml(value, emptyLabel = "无") {
+  if (Array.isArray(value)) {
+    if (!value.length) return `<span class="sound-empty">${escapeHtml(emptyLabel)}</span>`;
+    return `<ul>${value.map(item => `<li>${escapeHtml(soundTextValue(item))}</li>`).join("")}</ul>`;
+  }
+  const text = soundTextValue(value);
+  return text === "—" ? `<span class="sound-empty">${escapeHtml(emptyLabel)}</span>` : `<p>${escapeHtml(text)}</p>`;
+}
+
+function renderSoundPlan(content) {
+  const items = Array.isArray(content?.items) ? content.items : [];
+  const validation = content?.sound_validation || {};
+  const expected = Number(validation.expected_items || items.length || 0);
+  const actual = Number(validation.actual_items ?? items.length);
+  const missing = Array.isArray(validation.missing_indices) ? validation.missing_indices : [];
+  const issues = Array.isArray(validation.missing_required_fields) ? validation.missing_required_fields : [];
+  const dialogueShots = Array.isArray(validation.dialogue_shots) ? validation.dialogue_shots : [];
+  const silentShots = Array.isArray(validation.silent_shots) ? validation.silent_shots : [];
+  const status = String(validation.status || "");
+  const summaryClass = status === "fail" ? "blocking" : "ok";
+
+  const cards = items.map((item, position) => {
+    const rawIndex = item?.shot_index ?? position + 1;
+    const numericIndex = Number.parseInt(String(rawIndex).replace(/\D/g, ""), 10);
+    const indexText = Number.isFinite(numericIndex) ? String(numericIndex).padStart(2, "0") : String(rawIndex);
+    const hasDialogue = dialogueShots.includes(numericIndex);
+    const knownSilent = silentShots.includes(numericIndex);
+    const ambience = item?.ambience;
+    const foley = item?.foley ?? item?.foley_events;
+    const cues = item?.cues ?? item?.sound_cues;
+    const ducking = item?.ducking ?? item?.dialogue_ducking ?? item?.ducking_plan;
+    const negative = item?.negative_audio ?? item?.negative_audio_constraints ?? item?.negative;
+    const itemStatus = item?.status || "planned";
+    return `<article class="sound-shot-card">
+      <div class="sound-shot-head">
+        <div><span class="sound-shot-index">SHOT ${escapeHtml(indexText)}</span>${hasDialogue ? `<span class="sound-dialogue-flag">有对白</span>` : (knownSilent ? `<span class="sound-silent-flag">无对白镜</span>` : "")}</div>
+        <span class="pill ready">${escapeHtml(soundTextValue(itemStatus))}</span>
+      </div>
+      <div class="sound-primary-block"><span>环境 / Ambience</span>${soundListHtml(ambience, "未标注")}</div>
+      <div class="sound-two-col">
+        <div class="sound-block"><span>动作声 / Foley</span>${soundListHtml(foley, "无明确 Foley")}</div>
+        <div class="sound-block"><span>提示音 / Cues</span>${soundListHtml(cues, "无额外 Cue")}</div>
+      </div>
+      <div class="sound-two-col">
+        <div class="sound-block"><span>对白 Ducking</span>${soundListHtml(ducking, hasDialogue ? "未标注" : "无需对白压低")}</div>
+        <div class="sound-block negative"><span>Negative Audio</span>${soundListHtml(negative, "未标注")}</div>
+      </div>
+      ${(item?.notes || item?.scene_acoustics) ? `<details class="sound-details"><summary>声学与结构详情</summary>${item?.scene_acoustics ? `<div><strong>Scene acoustics</strong><p>${escapeHtml(soundTextValue(item.scene_acoustics))}</p></div>` : ""}${item?.notes ? `<div><strong>Notes</strong><p>${escapeHtml(soundTextValue(item.notes))}</p></div>` : ""}</details>` : ""}
+    </article>`;
+  }).join("");
+
+  return `<div class="sound-workbench">
+    <div class="sound-validation ${summaryClass}">
+      <div><strong>逐镜音效结构</strong><span>镜头覆盖 ${actual}/${expected || actual}</span><span>有对白镜 ${dialogueShots.length}</span><span>无对白镜 ${silentShots.length}</span>${status ? `<span>Harness 校验：${escapeHtml(status)}</span>` : ""}${missing.length ? `<span>缺失：${escapeHtml(missing.join(", "))}</span>` : ""}${issues.length ? `<span>结构问题：${issues.length}</span>` : ""}</div>
+      <button class="mini-button" data-revalidate-sound>重新校验当前音效（不重生成）</button>
+    </div>
+    <div class="sound-grid">${cards || '<div class="empty-canvas">当前没有逐镜音效条目。</div>'}</div>
+  </div>`;
+}
+
+async function revalidateSoundPlan(button = null) {
+  if (!state.selectedId) return;
+  if (button) button.disabled = true;
+  try {
+    toast("正在重新校验当前逐镜音效，不会重新生成声学设计…");
+    const result = await api(`/api/workspaces/${state.selectedId}/sound-plan/revalidate`, {method: "POST"});
+    await refreshCurrent();
+    state.tab = "sound_plan";
+    renderDetail();
+    const validation = result.sound_validation || {};
+    toast(`音效校验完成：${validation.actual_items ?? "?"}/${validation.expected_items ?? "?"} · ${validation.status || "unknown"}`);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindSoundPlanUi() {
+  document.querySelectorAll("[data-revalidate-sound]").forEach(button => button.addEventListener("click", () => {
+    revalidateSoundPlan(button).catch(error => toast(error.message));
+  }));
+}
+
+
+function reviewValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(reviewValue).filter(Boolean).join("；");
+  if (typeof value === "object") {
+    const preferred = value.text ?? value.message ?? value.description ?? value.evidence ?? value.note ?? value.name;
+    if (preferred !== undefined) return reviewValue(preferred);
+    try { return JSON.stringify(value); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+
+function renderReviewExecutionInfo(execution) {
+  const body = renderExecutionInfo(execution);
+  if (!body) return "";
+  return `<details class="review-context-details"><summary>查看总管执行上下文</summary>${body}</details>`;
+}
+
+function renderReview(content) {
+  const checks = Array.isArray(content?.checks) ? content.checks : [];
+  const blockingFailures = Array.isArray(content?.blocking_failures) ? content.blocking_failures : [];
+  const normalized = checks.map((check, index) => {
+    const status = String(check?.status || "warn").toLowerCase();
+    return {check: check || {}, status, index};
+  });
+  const order = {fail: 0, warn: 1, pass: 2};
+  normalized.sort((a, b) => (order[a.status] ?? 1) - (order[b.status] ?? 1) || a.index - b.index);
+  const failCount = normalized.filter(x => x.status === "fail").length;
+  const warnCount = normalized.filter(x => x.status === "warn").length;
+  const passCount = normalized.filter(x => x.status === "pass").length;
+  const blocked = blockingFailures.length > 0 || failCount > 0;
+
+  const blockerHtml = blockingFailures.length ? `<section class="review-blockers">
+    <div class="review-section-title"><strong>阻断项</strong><span>${blockingFailures.length} 项 · 修复后重新运行一致性检查</span></div>
+    <div class="review-blocker-list">${blockingFailures.map((failure, idx) => {
+      const title = typeof failure === "object" && failure ? (failure.name || failure.title || failure.check || `阻断 ${idx + 1}`) : `阻断 ${idx + 1}`;
+      const message = typeof failure === "object" && failure ? (failure.remediation || failure.message || failure.description || failure.evidence || "") : failure;
+      const owner = typeof failure === "object" && failure ? (failure.owner || failure.agent || failure.stage || "") : "";
+      return `<article class="review-blocker-card"><div><b>${escapeHtml(reviewValue(title))}</b>${owner ? `<span class="review-owner">责任：${escapeHtml(reviewValue(owner))}</span>` : ""}</div>${message ? `<p>${escapeHtml(reviewValue(message))}</p>` : ""}</article>`;
+    }).join("")}</div>
+  </section>` : "";
+
+  const cards = normalized.map(({check, status}) => {
+    const name = check.name || check.title || "未命名检查";
+    const evidence = check.evidence ?? check.details ?? check.finding ?? "";
+    const owner = check.owner ?? check.agent ?? check.stage ?? "";
+    const remediation = check.remediation ?? check.suggested_adjustment ?? check.action ?? check.fix ?? "";
+    return `<article class="review-check-card ${escapeHtml(status)}">
+      <div class="review-check-head"><b>${escapeHtml(reviewValue(name))}</b><span class="review-status ${escapeHtml(status)}">${escapeHtml(status.toUpperCase())}</span></div>
+      ${evidence ? `<div class="review-check-row"><span>证据</span><p>${escapeHtml(reviewValue(evidence))}</p></div>` : ""}
+      ${owner ? `<div class="review-check-row compact"><span>责任</span><p>${escapeHtml(reviewValue(owner))}</p></div>` : ""}
+      ${remediation ? `<div class="review-check-row"><span>修复</span><p>${escapeHtml(reviewValue(remediation))}</p></div>` : ""}
+    </article>`;
+  }).join("");
+
+  return `<div class="review-workbench">
+    <div class="review-summary ${blocked ? "blocking" : "ok"}">
+      <div class="review-summary-main"><strong>一致性检查</strong><span class="review-summary-state">${blocked ? "存在阻断，暂不放行" : "无阻断，可进入下一阶段"}</span></div>
+      <div class="review-summary-counts"><span class="fail">Fail ${failCount}</span><span class="warn">Warn ${warnCount}</span><span class="pass">Pass ${passCount}</span><span>Checks ${checks.length}</span></div>
+    </div>
+    ${blockerHtml}
+    <section class="review-checks"><div class="review-section-title"><strong>全部检查</strong><span>失败与警告优先显示；通过项保留用于审计</span></div><div class="review-check-grid">${cards || '<div class="empty-canvas">当前没有 QA 检查项。</div>'}</div></section>
   </div>`;
 }
 
@@ -568,10 +986,12 @@ function renderAssetCandidate(candidate, baseCandidateId) {
   const feedback = String(candidate.feedback || "").trim();
   return `<div class="visual-candidate ${isSelected ? "selected" : ""} ${isBase ? "edit-base" : ""}" data-candidate-card="${escapeHtml(candidate.id)}">
     <a class="visual-candidate-image" href="${escapeHtml(candidate.url || "#")}" target="_blank" rel="noopener">${renderMedia(candidate.url)}</a>
-    <div class="visual-candidate-meta"><span>${escapeHtml(candidate.model || "Seedream")}</span>${isSelected ? `<span class="pill ready">采用中</span>` : ""}${isBase ? `<span class="pill">调整基准</span>` : ""}</div>
+    <div class="visual-candidate-meta"><span>${escapeHtml(candidate.model || "Seedream")}</span>${isSelected ? `<span class="pill ready">当前采用</span>` : ""}${isBase ? `<span class="pill">调整基准</span>` : ""}</div>
     ${feedback ? `<div class="artifact-meta candidate-feedback-note">本次要求：${escapeHtml(feedback)}</div>` : ""}
     <div class="visual-candidate-actions">
-      ${isSelected ? "" : `<button class="mini-button ok" data-select-candidate="${escapeHtml(candidate.id)}">设为采用并锁定</button>`}
+      ${isSelected
+        ? `<button class="mini-button" data-unselect-candidate="${escapeHtml(candidate.id)}">解除采用 / 解锁</button>`
+        : `<button class="mini-button ok" data-select-candidate="${escapeHtml(candidate.id)}">设为采用并锁定</button>`}
       <button class="mini-button" data-base-candidate="${escapeHtml(candidate.id)}">基于这张调整</button>
       ${isSelected ? "" : `<button class="mini-button reject" data-delete-candidate="${escapeHtml(candidate.id)}">删除</button>`}
     </div>
@@ -580,7 +1000,14 @@ function renderAssetCandidate(candidate, baseCandidateId) {
 
 function preferredCandidateForAsset(kind, canonicalKey) {
   const candidates = currentCandidatesForAsset(kind, canonicalKey);
-  return candidates.find(candidate => candidate.selected) || candidates[candidates.length - 1] || null;
+  if (!candidates.length) return null;
+  const selected = candidates.find(candidate => candidate.selected) || null;
+  const latest = candidates[candidates.length - 1] || null;
+  // A selected candidate remains production truth, but it must never hide a newer
+  // adjustment candidate.  Showing the newest pending candidate lets the user
+  // actually see that generation changed something and switch adoption explicitly.
+  if (latest && !latest.selected) return latest;
+  return selected || latest;
 }
 
 function renderSingleAssetDetail(item, kind, idx = 0) {
@@ -592,9 +1019,16 @@ function renderSingleAssetDetail(item, kind, idx = 0) {
   const latest = candidates[candidates.length - 1];
   const baseCandidateId = rememberedBase || selected?.id || latest?.id || "";
   const rows = assetSpecRows(item, kind);
+  const artifactPreviewUrl = kind === "reference_images" ? String(item.url || "") : "";
   const candidateHtml = candidates.length
     ? candidates.map(c => renderAssetCandidate(c, baseCandidateId)).join("")
-    : `<div class="candidate-empty">还没有视觉候选。先“抽 1 张”，满意后点“设为采用并锁定”；不满意就写局部要求再抽。</div>`;
+    : artifactPreviewUrl
+      ? `<div class="visual-candidate artifact-reference-fallback">
+          <a class="visual-candidate-image" href="${escapeHtml(artifactPreviewUrl)}" target="_blank" rel="noopener">${renderMedia(artifactPreviewUrl)}</a>
+          <div class="visual-candidate-meta"><span>${escapeHtml(item.model || "Reference artifact")}</span><span class="pill ready">已恢复参考</span></div>
+          <div class="artifact-meta candidate-feedback-note">当前组合媒体已存在于 reference_images artifact，但本 revision 尚无独立候选行。可以直接检查；若要调整，下面“抽 1 张 / 抽 4 张”会以这张 artifact 图作为参考基准。</div>
+        </div>`
+      : `<div class="candidate-empty">还没有视觉候选。先“抽 1 张”，满意后点“设为采用并锁定”；不满意就写局部要求再抽。</div>`;
   return `<section class="asset-design-card detail-card" data-asset-stage="${escapeHtml(kind)}" data-canonical-key="${escapeHtml(canonicalKey)}">
     <div class="asset-design-header">
       <div><b>${escapeHtml(item.name || item.id || canonicalKey)}</b><div class="artifact-meta">${escapeHtml(canonicalKey)} · ${escapeHtml(kind === "reference_images" ? (item.source_kind || item.status || "reference") : (item.reuse_decision || item.decision || "CREATE"))}</div></div>
@@ -610,7 +1044,7 @@ function renderSingleAssetDetail(item, kind, idx = 0) {
         <div class="candidate-editor">
           <textarea rows="3" data-candidate-feedback placeholder="只改这个${escapeHtml(label)}。例如：${kind === "characters" ? "脸更接近原片、年龄感更明显；保留身份与识别色，只调整服装和气质" : kind === "scenes" ? "保持同一栋法国住宅 DNA；只调整这个空间的材质、光线或构图" : kind === "reference_images" ? "保持所有已绑定 canonical asset 的身份、脸、服装、场景结构和道具形态，只调整构图、相对位置、镜头感或光线" : "保持道具身份和关键结构；只调整材质、旧化程度或尺度"}"></textarea>
           ${candidateStatusHtml(kind, canonicalKey)}
-          <div class="candidate-editor-actions"><span class="artifact-meta">${baseCandidateId ? "默认基于当前采用/最近候选继续调整" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button></div>
+          <div class="candidate-editor-actions"><span class="artifact-meta">${baseCandidateId ? "默认基于当前采用/最近候选继续调整；锁定只决定下游采用，不会阻止抽新候选" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button></div>
         </div>
       </div>
     </div>
@@ -622,25 +1056,35 @@ function renderVisualAssetOverview(content, kind) {
   const label = assetStageLabel(kind);
   const artifact = currentArtifactForStage(kind);
   const revision = Number(artifact?.revision || 0);
-  const withCandidate = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).length).length;
-  const selectedCount = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).some(c => c.selected)).length;
+  const withCandidate = items.filter(item => {
+    const key = String(item.canonical_key || item.id || "");
+    return currentCandidatesForAsset(kind, key).length || (kind === "reference_images" && Boolean(item.url));
+  }).length;
+  const selectedCount = items.filter(item => {
+    const key = String(item.canonical_key || item.id || "");
+    return currentCandidatesForAsset(kind, key).some(c => c.selected)
+      || (kind === "reference_images" && item.status === "selected_candidate" && Boolean(item.url));
+  }).length;
   const tileRecords = items.map((item, idx) => {
     const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
     const candidate = preferredCandidateForAsset(kind, canonicalKey);
+    const artifactPreviewUrl = kind === "reference_images" ? String(item.url || "") : "";
+    const previewUrl = String(candidate?.url || artifactPreviewUrl || "");
+    const recoveredArtifactOnly = !candidate && Boolean(artifactPreviewUrl);
     const batchSelected = isBatchSelected(kind, canonicalKey);
-    const status = candidate?.selected ? "已采用" : candidate ? "候选" : "待出图";
+    const status = candidate?.selected ? "已采用" : candidate ? "候选" : recoveredArtifactOnly ? (item.status === "selected_candidate" ? "已恢复采用" : "已恢复参考") : "待出图";
     const sourceKind = String(item.source_kind || "");
     const sourceIds = Array.isArray(item.source_ids) ? item.source_ids : (Array.isArray(item.source_id) ? item.source_id : []);
     const isCombination = kind === "reference_images" && sourceKind === "combination";
     const title = isCombination ? "关系组合参考" : (item.name || item.id || canonicalKey);
     const subtitle = isCombination && sourceIds.length ? sourceIds.join(" + ") : canonicalKey;
     const html = `<div class="asset-overview-tile ${batchSelected ? "batch-selected" : ""} ${isCombination ? "reference-combination-tile" : ""}" data-asset-stage="${escapeHtml(kind)}" data-canonical-key="${escapeHtml(canonicalKey)}">
-      <div class="asset-overview-image" data-open-visual-asset="${escapeHtml(canonicalKey)}">${candidate?.url ? renderMedia(candidate.url) : `<div class="asset-overview-empty"><span>＋</span><small>暂无候选</small></div>`}</div>
+      <div class="asset-overview-image" data-open-visual-asset="${escapeHtml(canonicalKey)}">${previewUrl ? renderMedia(previewUrl) : `<div class="asset-overview-empty"><span>＋</span><small>暂无候选</small></div>`}</div>
       <div class="asset-overview-meta">
         <div><b>${escapeHtml(title)}</b><div class="artifact-meta ${isCombination ? "reference-combination-binding" : ""}">${escapeHtml(subtitle)}</div></div>
-        <span class="pill ${candidate?.selected ? "ready" : ""}">${escapeHtml(status)}</span>
+        <span class="pill ${(candidate?.selected || (recoveredArtifactOnly && item.status === "selected_candidate")) ? "ready" : ""}">${escapeHtml(status)}</span>
       </div>
-      <div class="asset-overview-actions"><label class="batch-select-box"><input type="checkbox" data-batch-select ${batchSelected ? "checked" : ""}><span>加入批量</span></label><div class="asset-overview-action-buttons">${candidate ? (candidate.selected ? `<button class="mini-button ok" disabled>已采用</button>` : `<button class="mini-button ok" data-quick-select-candidate="${escapeHtml(candidate.id)}">确认采用</button>`) : ""}<button class="mini-button" data-open-visual-asset="${escapeHtml(canonicalKey)}">查看 / 调整</button></div></div>
+      <div class="asset-overview-actions"><label class="batch-select-box"><input type="checkbox" data-batch-select ${batchSelected ? "checked" : ""}><span>加入批量</span></label><div class="asset-overview-action-buttons">${candidate ? (candidate.selected ? `<button class="mini-button ok" disabled>当前采用</button><button class="mini-button" data-quick-unselect-candidate="${escapeHtml(candidate.id)}">解锁</button>` : `<button class="mini-button ok" data-quick-select-candidate="${escapeHtml(candidate.id)}">${currentCandidatesForAsset(kind, canonicalKey).some(c => c.selected) ? "采用这个新候选" : "确认采用"}</button>`) : ""}<button class="mini-button" data-open-visual-asset="${escapeHtml(canonicalKey)}">查看 / 调整</button></div></div>
     </div>`;
     return {html, sourceKind, isCombination};
   });
@@ -662,7 +1106,7 @@ function renderVisualAssetOverview(content, kind) {
   const validation = kind === "reference_images" ? (content?.reference_validation || {}) : {};
   const missingCombinations = kind === "reference_images" && Array.isArray(content?.missing_combinations) ? content.missing_combinations : [];
   const validationStatus = String(validation?.status || "").toLowerCase();
-  const referenceDiagnostics = kind === "reference_images" ? `<div class="reference-diagnostics ${(missingCombinations.length || validationStatus === "fail") ? "blocking" : "ok"}"><strong>参考图绑定状态</strong><span>上游已采用：${Number(coverage.upstream_selected_count || 0)}</span><span>孤立参考：${Number(coverage.isolated_completed || 0)}/${Number(coverage.isolated_expected || 0)}</span><span>组合参考：${Number(coverage.combination_completed || 0)}/${Number(coverage.combination_expected || 0)}</span>${validationStatus ? `<span>Harness 校验：${escapeHtml(validationStatus)}</span>` : ""}${missingCombinations.length ? `<span>缺失组合：${missingCombinations.length}</span>` : `<span>组合完整</span>`}</div>` : "";
+  const referenceDiagnostics = kind === "reference_images" ? `<div class="reference-diagnostics ${(missingCombinations.length || validationStatus === "fail") ? "blocking" : "ok"}"><strong>参考图绑定状态</strong><span>上游已采用：${Number(coverage.upstream_selected_count || 0)}</span><span>孤立参考：${Number(coverage.isolated_completed || 0)}/${Number(coverage.isolated_expected || 0)}</span><span>组合参考：${Number(coverage.combination_completed || 0)}/${Number(coverage.combination_expected || 0)}</span>${validationStatus ? `<span>Harness 校验：${escapeHtml(validationStatus)}</span>` : ""}${missingCombinations.length ? `<span>缺失组合：${missingCombinations.length}</span>` : `<span>组合完整</span>`}<button class="mini-button" data-reconcile-reference-bindings>同步当前采用绑定（不重画）</button></div>` : "";
   const referenceGallery = kind === "reference_images" ? (() => {
     const isolated = tileRecords.filter(record => !record.isCombination).map(record => record.html).join("");
     const combinations = tileRecords.filter(record => record.isCombination).map(record => record.html).join("");
@@ -696,6 +1140,25 @@ function renderVisualAssetOverview(content, kind) {
   </div>`;
 }
 
+async function reconcileReferenceBindings(button = null) {
+  if (!state.selectedId) return;
+  if (!window.confirm("只同步参考图与当前角色/场景/道具已采用候选的绑定，不重新生成任何图片。继续吗？")) return;
+  if (button) button.disabled = true;
+  try {
+    toast("正在同步参考图 candidate binding（不重画）…");
+    const result = await api(`/api/workspaces/${state.selectedId}/reference-images/reconcile-bindings`, {method:"POST"});
+    await refreshCurrent();
+    state.tab = "reference_images";
+    renderDetail();
+    const validation = result.reference_validation || {};
+    const changes = Array.isArray(result.binding_changes) ? result.binding_changes.length : 0;
+    if (validation.status === "pass") toast(`绑定同步完成：${changes} 项更新，未重新生成图片`);
+    else toast(`绑定同步完成，但仍有 ${Array.isArray(result.issues) ? result.issues.length : 0} 个冲突需要处理`);
+  } finally {
+    if (button && document.body.contains(button)) button.disabled = false;
+  }
+}
+
 async function quickSelectVisualCandidate(candidateId, button = null) {
   if (!candidateId) return;
   if (button) button.disabled = true;
@@ -704,6 +1167,20 @@ async function quickSelectVisualCandidate(candidateId, button = null) {
     await refreshCurrent();
     renderDetail();
     toast("已确认采用并锁定");
+  } finally {
+    if (button && document.body.contains(button)) button.disabled = false;
+  }
+}
+
+async function unselectVisualCandidate(candidateId, button = null) {
+  if (!candidateId) return;
+  if (!window.confirm("解除当前采用锁定吗？图片不会删除；它会保留为普通候选，相关下游结果会等待重新确认。")) return;
+  if (button) button.disabled = true;
+  try {
+    await api(`/api/workspaces/${state.selectedId}/asset-candidates/${candidateId}/unselect`, {method:"POST"});
+    await refreshCurrent();
+    renderDetail();
+    toast("已解除采用锁定；图片仍保留为候选");
   } finally {
     if (button && document.body.contains(button)) button.disabled = false;
   }
@@ -745,6 +1222,12 @@ function bindVisualAssetOverviewUi() {
     try { await quickSelectVisualCandidate(button.dataset.quickSelectCandidate || "", button); }
     catch (error) { toast(error.message); }
   }));
+  document.querySelectorAll("[data-quick-unselect-candidate]").forEach(button => button.addEventListener("click", async event => {
+    event.preventDefault();
+    event.stopPropagation();
+    try { await unselectVisualCandidate(button.dataset.quickUnselectCandidate || "", button); }
+    catch (error) { toast(error.message); }
+  }));
   document.querySelectorAll("[data-quick-select-all-current]").forEach(button => button.addEventListener("click", async event => {
     event.preventDefault();
     try { await quickSelectAllCurrentCandidates(button.dataset.quickSelectAllCurrent || "", button); }
@@ -773,8 +1256,15 @@ function renderAssetDesignWorkbench(content, kind) {
   const label = assetStageLabel(kind);
   const artifact = currentArtifactForStage(kind);
   const revision = Number(artifact?.revision || 0);
-  const withCandidate = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).length).length;
-  const selectedCount = items.filter(item => currentCandidatesForAsset(kind, String(item.canonical_key || item.id || "")).some(c => c.selected)).length;
+  const withCandidate = items.filter(item => {
+    const key = String(item.canonical_key || item.id || "");
+    return currentCandidatesForAsset(kind, key).length || (kind === "reference_images" && Boolean(item.url));
+  }).length;
+  const selectedCount = items.filter(item => {
+    const key = String(item.canonical_key || item.id || "");
+    return currentCandidatesForAsset(kind, key).some(c => c.selected)
+      || (kind === "reference_images" && item.status === "selected_candidate" && Boolean(item.url));
+  }).length;
   const cards = items.map((item, idx) => {
     const canonicalKey = String(item.canonical_key || item.id || `asset-${idx+1}`);
     const candidates = currentCandidatesForAsset(kind, canonicalKey);
@@ -842,7 +1332,12 @@ async function generateCandidateForCard(card, count = 1) {
     await refreshCurrent();
     state.tab = stage;
     renderDetail();
-    toast(partial ? `已生成 ${created.length}/${result.requested_count || count} 张候选` : `已生成 ${created.length} 张候选`);
+    const hadSelected = Boolean(selected);
+    toast(partial
+      ? `已生成 ${created.length}/${result.requested_count || count} 张候选`
+      : hadSelected
+        ? `已生成 ${created.length} 张新候选；原采用图仍锁定，下方/总览会优先显示最新候选供比较`
+        : `已生成 ${created.length} 张候选`);
     return result;
   } catch (error) {
     state.candidateRequestStatus[key] = {type:"error", text:`生成失败：${error.message || error}`};
@@ -886,6 +1381,9 @@ async function generateBatchCandidates(kind, canonicalKeys, feedback, count = 1,
 }
 
 function bindAssetCandidateUi() {
+  document.querySelectorAll("[data-reconcile-reference-bindings]").forEach(button => button.addEventListener("click", () => {
+    reconcileReferenceBindings(button).catch(error => toast(error.message));
+  }));
   document.querySelectorAll("[data-generate-candidate]").forEach(button => button.addEventListener("click", async () => {
     const card = button.closest("[data-asset-stage]");
     if (!card) return;
@@ -904,6 +1402,10 @@ function bindAssetCandidateUi() {
       await api(`/api/workspaces/${state.selectedId}/asset-candidates/${button.dataset.selectCandidate}/select`, {method:"POST"});
       await refreshCurrent(); renderDetail(); toast("已设为下游采用图");
     } catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-unselect-candidate]").forEach(button => button.addEventListener("click", async () => {
+    try { await unselectVisualCandidate(button.dataset.unselectCandidate || "", button); }
+    catch (error) { toast(error.message); }
   }));
   document.querySelectorAll("[data-delete-candidate]").forEach(button => button.addEventListener("click", async () => {
     if (!window.confirm("删除这张候选图吗？")) return;
@@ -1239,10 +1741,44 @@ async function chatStageGuidance(messageOverride = null, stageOverride = null) {
 
 async function ensureBoundDirectorPlan(stage) {
   const typed = $("#stageGuidanceInput").value.trim();
-  const message = typed || "请结合最新生成结果、项目记忆和已有沟通，确认本节点下一次执行方案；如无阻塞问题，请直接给出可执行指令。";
-  // Bind the director chat to the stage being advanced, not whichever completed
-  // artifact currently owns the review composer.
-  const result = await chatStageGuidance(message, stage);
+
+  // If the user has just typed a new requirement, bind that new turn first.
+  if (typed) {
+    const result = await chatStageGuidance(typed, stage);
+    const plan = result.plan || {};
+    if (plan.requires_user_input) {
+      const questions = Array.isArray(plan.questions) ? plan.questions.join("；") : "总管需要更多信息";
+      throw new Error(`总管需要你先补充：${questions}`);
+    }
+    return result;
+  }
+
+  // A plan already confirmed in Director Chat is an executable binding. Advancing
+  // must reuse it instead of asking Kimi to confirm the same thing again. The
+  // backend /run endpoint still validates the fingerprint, so an actually stale
+  // plan remains safely blocked.
+  const record = state.detail?.guidance?.[stage] || {};
+  const cachedPlan = record.director_plan || {};
+  const cachedHash = String(record.plan_input_hash || "").trim();
+  const effective = String(record.user_instruction || "").trim();
+  if (cachedHash && effective && Object.keys(cachedPlan).length) {
+    if (cachedPlan.requires_user_input) {
+      const questions = Array.isArray(cachedPlan.questions) ? cachedPlan.questions.join("；") : "总管需要更多信息";
+      throw new Error(`总管需要你先补充：${questions}`);
+    }
+    return {
+      plan: cachedPlan,
+      effective_instruction: effective,
+      input_hash: cachedHash,
+      reused_bound_plan: true,
+    };
+  }
+
+  // No executable binding exists yet: ask the director once, bind it, then run.
+  const result = await chatStageGuidance(
+    "请结合最新生成结果、项目记忆和已有沟通，确认本节点下一次执行方案；如无阻塞问题，请直接给出可执行指令。",
+    stage,
+  );
   const plan = result.plan || {};
   if (plan.requires_user_input) {
     const questions = Array.isArray(plan.questions) ? plan.questions.join("；") : "总管需要更多信息";

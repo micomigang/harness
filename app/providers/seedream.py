@@ -11,6 +11,11 @@ import httpx
 
 from .base import WorkflowProvider
 from app.guidance import sanitize_parameter_overrides
+from app.reference_plan import (
+    canonical_combination_key,
+    extract_explicit_reference_combinations,
+    source_ids_from_combination_key,
+)
 
 
 class SeedreamError(RuntimeError):
@@ -100,12 +105,42 @@ class SeedreamProvider(WorkflowProvider):
         combinations: list[list[str]] = []
         seen_combinations: set[tuple[str, ...]] = set()
         for combination_text in combination_sources:
-            for group in self._extract_reference_combinations(combination_text):
+            for group in extract_explicit_reference_combinations(combination_text):
                 signature = tuple(group)
                 if signature in seen_combinations:
                     continue
                 seen_combinations.add(signature)
                 combinations.append(group)
+        # Existing relationship renders are reusable production media. During a
+        # reconcile/regenerate pass the current artifact may already have been
+        # superseded, so also consult persisted reference candidate history. Exact
+        # canonical combination identity is the lookup key; no fuzzy matching.
+        existing_combination_lookup: dict[str, dict[str, Any]] = {}
+
+        # First prefer an item still present on the current/stale reference artifact.
+        for artifact in context.get("artifacts", []) or []:
+            if not isinstance(artifact, dict) or str(artifact.get("kind") or "") != "reference_images":
+                continue
+            for ref_item in ((artifact.get("content") or {}).get("items") or []):
+                if not isinstance(ref_item, dict) or str(ref_item.get("source_kind") or "") != "combination":
+                    continue
+                source_ids = ref_item.get("source_id") if isinstance(ref_item.get("source_id"), list) else ref_item.get("source_ids")
+                source_ids = [str(x).strip() for x in (source_ids or []) if str(x).strip()]
+                ref_key = str(ref_item.get("canonical_key") or ref_item.get("reference_key") or canonical_combination_key(source_ids))
+                if source_ids and ref_item.get("url") and ref_key not in existing_combination_lookup:
+                    existing_combination_lookup[ref_key] = dict(ref_item)
+
+        # Candidate history survives reference artifact revision replacement and is
+        # therefore the recovery source for combinations produced by older revs.
+        # Database ordering is newest-first; keep the first usable exact key.
+        for candidate in context.get("reference_candidate_history", []) or []:
+            if not isinstance(candidate, dict) or not candidate.get("url"):
+                continue
+            ref_key = str(candidate.get("canonical_key") or "").strip()
+            if not source_ids_from_combination_key(ref_key) or ref_key in existing_combination_lookup:
+                continue
+            existing_combination_lookup[ref_key] = dict(candidate)
+
         # Explicit isolated+combination requirements are user authorization for the
         # necessary calls. Do not silently drop props/the seventh combination merely
         # because IMAGE_MAX_ASSETS defaults below the explicitly bound plan. The
@@ -201,9 +236,7 @@ class SeedreamProvider(WorkflowProvider):
                 if missing:
                     missing_combinations.append({"source_ids": source_ids, "missing_inputs": missing, "reason": "missing isolated reference"})
                     continue
-                if used_generation_budget >= generation_budget:
-                    missing_combinations.append({"source_ids": source_ids, "missing_inputs": [], "reason": "generation budget reached"})
-                    continue
+
                 reference_values: list[str] = []
                 input_candidate_ids: list[str] = []
                 for key in source_ids:
@@ -216,11 +249,43 @@ class SeedreamProvider(WorkflowProvider):
                         reference_values.append(value)
                     if ref_item.get("candidate_id"):
                         input_candidate_ids.append(str(ref_item.get("candidate_id")))
+
+                reference_key = canonical_combination_key(source_ids)
+                prompt = self._combination_prompt(source_ids, prompt_addendum)
+
+                # Reconcile/fill semantics: exact existing relationship media wins.
+                # Reuse its URL and only refresh the upstream candidate bindings.
+                existing_combo = existing_combination_lookup.get(reference_key)
+                if existing_combo and existing_combo.get("url"):
+                    was_selected = bool(existing_combo.get("selected")) or str(existing_combo.get("status") or "").lower() in {
+                        "selected_candidate", "selected", "locked", "upstream_adopted"
+                    }
+                    combo = {
+                        "source_kind": "combination",
+                        "source_id": list(source_ids),
+                        "source_ids": list(source_ids),
+                        "canonical_key": reference_key,
+                        "reference_key": reference_key,
+                        "name": " + ".join(source_ids),
+                        "model": existing_combo.get("model") or self.model,
+                        "remote_url": existing_combo.get("remote_url") or "",
+                        "url": existing_combo.get("url") or "",
+                        "local_path": existing_combo.get("local_path") or "",
+                        "status": "selected_candidate" if was_selected else "candidate",
+                        "origin": "existing_reference_reuse",
+                        "input_candidate_ids": input_candidate_ids,
+                        "prompt": str(existing_combo.get("prompt") or prompt),
+                    }
+                    items.append(combo)
+                    continue
+
+                if used_generation_budget >= generation_budget:
+                    missing_combinations.append({"source_ids": source_ids, "missing_inputs": [], "reason": "generation budget reached"})
+                    continue
                 if len(reference_values) < 2:
                     missing_combinations.append({"source_ids": source_ids, "missing_inputs": [], "reason": "fewer than two usable reference images"})
                     continue
-                reference_key = "combo__" + "__".join(source_ids)
-                prompt = self._combination_prompt(source_ids, prompt_addendum)
+
                 combo = self._request_and_download(
                     client,
                     workspace_id=workspace_id,
@@ -330,51 +395,10 @@ class SeedreamProvider(WorkflowProvider):
 
     @staticmethod
     def _extract_reference_combinations(text: str) -> list[list[str]]:
-        """Extract only *explicit* relationship combinations from user wording.
-
-        A combination is considered explicit when canonical asset keys are joined
-        with a plus sign on the same line, e.g. ``char_a + scene_b + prop_c``.
-        Merely mentioning several asset keys in a category summary must never create
-        a combination.  This keeps the parser generic while preventing director
-        paraphrases from manufacturing all-character/all-scene/all-prop composites.
-        """
-        combinations: list[list[str]] = []
-        seen: set[tuple[str, ...]] = set()
-        key_pattern = re.compile(r"\b(?:char|scene|prop)_[A-Za-z0-9_]+\b")
-        plus_pattern = re.compile(r"[+＋]")
-        for raw_line in str(text or "").splitlines():
-            line = raw_line.strip()
-            if not line or not plus_pattern.search(line):
-                continue
-            keys: list[str] = []
-            for match in key_pattern.findall(line):
-                if match not in keys:
-                    keys.append(match)
-            if len(keys) < 2:
-                continue
-            # Require at least one plus-separated relation between the extracted
-            # keys.  This intentionally ignores prose lists separated by commas,
-            # slashes or parentheses.
-            fragments = [part.strip() for part in plus_pattern.split(line)]
-            joined_keys: list[str] = []
-            for fragment in fragments:
-                found = key_pattern.findall(fragment)
-                if found:
-                    joined_keys.append(found[-1])
-            if len(joined_keys) < 2:
-                continue
-            normalized: list[str] = []
-            for key in joined_keys:
-                if key not in normalized:
-                    normalized.append(key)
-            if len(normalized) < 2:
-                continue
-            signature = tuple(normalized[:10])
-            if signature in seen:
-                continue
-            seen.add(signature)
-            combinations.append(list(signature))
-        return combinations[:12]
+        # Backward-compatible wrapper; implementation is shared with the
+        # orchestrator so planning, reconcile and rendering interpret explicit
+        # combination intent identically.
+        return extract_explicit_reference_combinations(text)
 
     @staticmethod
     def _combination_prompt(source_ids: list[str], prompt_addendum: str = "") -> str:

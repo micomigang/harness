@@ -190,3 +190,257 @@ def test_human_approval_can_override_director_regenerate_review(tmp_path: Path):
     db.set_approval(workspace_id, "script_approved", "approved", "human override")
     action = orchestrator.next_actions(workspace_id)[0]
     assert not (action.get("stage") == "script" and action.get("review_blocked"))
+
+
+def test_storyboard_normalization_validates_full_sequence_and_reconciles_duration():
+    shots = []
+    for index in range(1, 15):
+        shots.append(
+            {
+                "index": f"{index:02d}",
+                "duration_seconds": 8 if index < 14 else 10,
+                "story_beat": f"beat {index}",
+                "visual_prompt": f"visual {index}",
+                "asset_bindings": {
+                    "characters": ["char_a"],
+                    "scenes": ["scene_a"],
+                    "props": [],
+                    "reference_images": [
+                        {
+                            "canonical_key": "combo__char_a__scene_a",
+                            "candidate_id": "candidate-a",
+                            "url": "/media/a.jpg",
+                            "source_kind": "combination",
+                        }
+                    ],
+                },
+            }
+        )
+    normalized = Orchestrator._normalize_storyboard(
+        {"shots": shots, "estimated_seconds": 999},
+        workspace={"settings": {"storyboard_count": 14}},
+        execution_directive={"parameter_overrides": {}},
+        user_instruction="严格拆分为 14 个连续镜头",
+    )
+    validation = normalized["storyboard_validation"]
+    assert validation["status"] == "pass"
+    assert validation["expected_shots"] == 14
+    assert validation["actual_shots"] == 14
+    assert validation["actual_indices"] == list(range(1, 15))
+    assert normalized["estimated_seconds"] == 114
+    assert normalized["estimated_seconds_model"] == 999
+
+
+def test_storyboard_normalization_reports_real_missing_tail_shots():
+    shots = [
+        {
+            "index": index,
+            "duration_seconds": 8,
+            "story_beat": f"beat {index}",
+            "visual_prompt": f"visual {index}",
+            "asset_bindings": {
+                "scenes": ["scene_a"],
+                "reference_images": [{"canonical_key": "scene_a", "candidate_id": "c", "url": "/a.jpg"}],
+            },
+        }
+        for index in range(1, 11)
+    ]
+    normalized = Orchestrator._normalize_storyboard(
+        {"shots": shots, "estimated_seconds": 80},
+        workspace={"settings": {"storyboard_count": 14}},
+        execution_directive={},
+        user_instruction="14 shots",
+    )
+    validation = normalized["storyboard_validation"]
+    assert validation["status"] == "fail"
+    assert validation["actual_shots"] == 10
+    assert validation["missing_indices"] == [11, 12, 13, 14]
+
+
+def test_dialogue_plan_normalization_validates_complete_storyboard_mapping():
+    storyboard = {
+        "shots": [
+            {"index": index, "duration_seconds": 10}
+            for index in range(1, 15)
+        ]
+    }
+    silent = {2, 9, 14}
+    items = []
+    for index in range(1, 15):
+        if index in silent:
+            items.append({
+                "shot_index": index,
+                "status": "silent",
+                "speaker_id": None,
+                "text": "",
+                "language": "fr",
+                "timing": {"start_seconds": 0, "end_seconds": 0},
+                "subtitle": "",
+                "lip_sync_target": False,
+            })
+        else:
+            items.append({
+                "shot_index": index,
+                "status": "dialogue",
+                "speaker_id": "char_a",
+                "text": f"Bonjour {index}",
+                "language": "fr",
+                "timing": {"start_seconds": 1, "end_seconds": 3},
+                "subtitle": f"Bonjour {index}",
+                "lip_sync_target": True,
+            })
+    normalized = Orchestrator._normalize_dialogue_plan(
+        {"items": items}, storyboard_content=storyboard
+    )
+    validation = normalized["dialogue_validation"]
+    assert validation["status"] == "pass"
+    assert validation["expected_items"] == 14
+    assert validation["actual_items"] == 14
+    assert validation["missing_indices"] == []
+    assert validation["dialogue_items"] == 11
+    assert validation["silent_items"] == 3
+    assert normalized["items"][0]["dialogue_text"] == "Bonjour 1"
+
+
+def test_dialogue_review_guard_suppresses_ten_item_preview_false_negative():
+    artifact = {
+        "content": {
+            "dialogue_validation": {
+                "status": "pass",
+                "expected_items": 14,
+                "actual_items": 14,
+            }
+        }
+    }
+    review = {
+        "recommended_action": "regenerate_current",
+        "assessment": "only 10 items",
+        "deviations": ["产物仅包含 10 个 items，缺失 shot_index 11–14"],
+        "suggested_adjustments": ["补全 11–14"],
+    }
+    guarded = Orchestrator._guard_dialogue_plan_review(review, artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["deviations"] == []
+    assert guarded["harness_review_guard"]["suppressed_structural_deviations"]
+
+
+
+def test_sound_plan_validation_uses_complete_storyboard_sequence():
+    storyboard = {"shots": [{"index": i, "duration_seconds": 8} for i in range(1, 15)]}
+    dialogue = {"items": [
+        {"shot_index": i, "status": "silent" if i in {2, 9, 14} else "dialogue"}
+        for i in range(1, 15)
+    ]}
+    items = [
+        {
+            "shot_index": i,
+            "ambience": "room tone",
+            "foley": ["cloth"],
+            "cues": [] if i in {2, 9, 14} else ["subtle cue"],
+            "ducking": "none" if i in {2, 9, 14} else "duck under dialogue",
+            "negative_audio": ["no BGM", "no spoken words"],
+            "status": "planned",
+        }
+        for i in range(1, 15)
+    ]
+    normalized = Orchestrator._normalize_sound_plan(
+        {"items": items}, storyboard_content=storyboard, dialogue_content=dialogue
+    )
+    validation = normalized["sound_validation"]
+    assert validation["status"] == "pass"
+    assert validation["expected_items"] == 14
+    assert validation["actual_items"] == 14
+    assert validation["missing_indices"] == []
+    assert validation["dialogue_shots"] == [1,3,4,5,6,7,8,10,11,12,13]
+    assert validation["silent_shots"] == [2,9,14]
+
+
+def test_sound_review_guard_suppresses_ten_item_preview_false_negative():
+    artifact = {"content": {"sound_validation": {"status": "pass", "expected_items": 14, "actual_items": 14}}}
+    review = {
+        "recommended_action": "regenerate_current",
+        "assessment": "only 10 items",
+        "deviations": ["产物仅包含 10 个 items，缺失 shot_index 11–14"],
+        "suggested_adjustments": ["补全 11–14"],
+    }
+    guarded = Orchestrator._guard_sound_plan_review(review, artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["deviations"] == []
+    assert guarded["harness_review_guard"]["suppressed_structural_deviations"]
+
+
+def test_storyboard_expected_count_recognizes_compact_chinese_jing_and_beats_workspace_default():
+    expected = Orchestrator._storyboard_expected_count(
+        {"settings": {"storyboard_count": 8}},
+        {"parameter_overrides": {}},
+        "严格保留当前 storyboard 的 14 镜结构，总时长不变",
+        previous_shot_count=14,
+    )
+    assert expected == 14
+
+
+def test_storyboard_expected_count_preserves_previous_board_before_workspace_default():
+    expected = Orchestrator._storyboard_expected_count(
+        {"settings": {"storyboard_count": 8}},
+        {"parameter_overrides": {}},
+        "仅修复 asset_bindings，不改写任何镜头内容",
+        previous_shot_count=14,
+    )
+    assert expected == 14
+
+
+def test_storyboard_normalization_hydrates_reference_metadata_from_production_truth():
+    shots = [{
+        "index": 1,
+        "duration_seconds": 10,
+        "story_beat": "beat",
+        "visual_prompt": "visual",
+        "asset_bindings": {
+            "characters": ["char_son"],
+            "scenes": ["scene_foyer"],
+            "props": [],
+            "reference_images": [{"canonical_key": "char_son"}],
+        },
+    }]
+    reference_content = {
+        "items": [{
+            "canonical_key": "char_son",
+            "source_kind": "character",
+            "candidate_id": "candidate-son",
+            "url": "/media/son.png",
+            "status": "selected_candidate",
+        }]
+    }
+    normalized = Orchestrator._normalize_storyboard(
+        {"shots": shots, "estimated_seconds": 10},
+        workspace={"settings": {"storyboard_count": 8}},
+        execution_directive={"parameter_overrides": {}},
+        user_instruction="1 镜",
+        reference_content=reference_content,
+        previous_shot_count=1,
+    )
+    ref = normalized["shots"][0]["asset_bindings"]["reference_images"][0]
+    assert ref["candidate_id"] == "candidate-son"
+    assert ref["url"] == "/media/son.png"
+    assert ref["source_kind"] == "character"
+    assert normalized["storyboard_validation"]["reference_binding_gaps"] == []
+    assert normalized["storyboard_validation"]["reference_metadata_hydrated"] == 1
+    assert normalized["storyboard_validation"]["status"] == "pass"
+
+
+def test_storyboard_review_guard_does_not_require_downstream_qa_closure():
+    artifact = {
+        "content": {
+            "storyboard_validation": {"status": "pass"},
+        }
+    }
+    review = {
+        "recommended_action": "regenerate_current",
+        "assessment": "missing downstream proof",
+        "deviations": ["未提供 continuity_qa 复验结果以证明 blocking failures 已关闭"],
+        "suggested_adjustments": ["重新运行 continuity_qa"],
+    }
+    guarded = Orchestrator._guard_storyboard_review(review, artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["deviations"] == []
+    assert guarded["harness_review_guard"]["suppressed_structural_deviations"]

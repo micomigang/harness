@@ -1,0 +1,11 @@
+1. Completely restart Harness, then hard-refresh the browser.
+2. Open Reference Images and choose a combination that currently shows “当前采用/已锁定视觉”.
+3. Without unlocking it, click “基于这张调整”, enter a visible composition change, and generate 1 candidate.
+   Expected: the old image is still the production truth, but the newest generated image is immediately visible as the pending candidate in overview/detail; it does not look like “nothing changed”.
+4. Click “采用这个新候选”.
+   Expected: selection moves to the new candidate and downstream state is invalidated as before.
+5. On a selected candidate click “解除采用 / 解锁” (or overview “解锁” when shown).
+   Expected: candidate image is retained, selected=false, UI becomes 待选视觉, and the candidate can still be used as adjustment base or re-selected.
+6. Generate again from an unlocked candidate.
+   Expected: normal generation works; no selected candidate is silently created.
+7. Python/JS syntax checks for this delta were run before packaging.

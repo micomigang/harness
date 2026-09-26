@@ -1,0 +1,13 @@
+1. Stop Harness completely.
+2. Extract this ZIP over the project root so `oiioii-harness/...` overwrites matching files.
+3. Restart Harness and hard-refresh the browser.
+4. Stay on Reference Images. Do NOT clear the current area/history.
+5. Preferred recovery path: click `同步当前采用绑定（不重画）` once.
+   - If historical combo candidates from the previous good revision still exist, the 7 planned combinations should be restored without Seedream.
+   - `组合参考` should no longer display 0/0 when the bound guidance explicitly contains combo__... or plus-delimited relationships.
+6. If any planned combination has no historical URL, use the normal purple Reference Images run/regenerate flow. Existing combinations are reused; only truly missing combinations are rendered.
+7. Expected validation: combination_expected comes from the explicit bound plan, combination_completed reflects actual items, and status is pass only when coverage is complete.
+
+Regression checks run while building this patch:
+- Python compile: passed for orchestrator.py, seedream.py, reference_plan.py
+- Seedream/reference parser tests: 14 passed

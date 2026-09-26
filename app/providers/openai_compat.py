@@ -82,6 +82,7 @@ DIRECTOR_SYSTEM_PROMPT = (
     "questions should contain only genuinely blocking ambiguities; otherwise make a conservative interpretation and continue. "
     "When interaction_mode is regenerate_current, treat the current-stage artifact as a draft under revision. Preserve parts that already satisfy the user, merge the latest feedback with still-valid earlier requirements, and change only what is necessary unless the user asks for a full rewrite. Do not ask the user to restate prior requirements. "
     "In regenerate_current mode, reply must explicitly summarize what you understood, what will be kept, what will change, and any downstream work that will be invalidated. effective_instruction must be a consolidated replacement instruction rather than an append-only transcript. "
+    "Keep each stage acceptance contract stage-local. A current-stage execution directive may describe downstream reruns or QA as NEXT ACTIONS, but must not require evidence from a downstream artifact that regeneration will invalidate or that cannot exist until later in the linear workflow. Never promise that a current stage will automatically execute continuity_qa/review/dialogue/sound/video unless the harness explicitly owns that orchestration. "
     "For asset_manifest specifically, the canonical pipeline asset types are character, scene and prop. Treat costume/wardrobe references in older guidance as character metadata and set/location references as scene assets unless the latest user message explicitly changes the data model; do not preserve stale legacy type wording as a quota. script.asset_requirements IDs are source bindings and belong in source_requirement_keys; the manifest canonical_key is a separate stable normalized production identity. Do not require canonical_key to equal CHAR_*/LOC_*/PROP_* screenplay IDs. continuity_lock is canonically an array of immutable rule strings; historical true/false wording expresses lock intent only. "
     "Asset Manifest counts are evidence-derived. Never copy an exact historical total (for example 10/12/14 or a 5/5/4 shape) from conversation_history, an older review, existing_effective_instruction or a previous manifest into effective_instruction/acceptance_criteria as a binding target. Preserve content-specific requests that remain valid, but let script.asset_requirements plus supported extras determine the total. If a harness-owned asset_manifest_contract is present, it overrides conflicting historical count/taxonomy/key/lock wording. "
     "For characters/scenes/props, distinguish SOURCE VISUAL EVIDENCE from TARGET-MARKET PRODUCTION DESIGN. Source-cultural clothing, interiors or props are not automatically immutable production styling. Preserve dramatic function and recognisable continuity anchors, but explicitly localize culturally specific styling to workspace.settings.target_market before image/video generation. The visual provider prompt should be English by default; story dialogue/visible language remains the localized target language where applicable."
@@ -96,7 +97,11 @@ DIRECTOR_REVIEW_SYSTEM_PROMPT = (
     "recommended_action should be one of proceed, approve_current, regenerate_current, adjust_next_stage, wait_for_user. Use regenerate_current when the artifact materially violates a bound acceptance criterion, invents unsupported facts as source evidence, or is structurally unusable downstream; do not recommend approval merely because an artifact exists. "
     "For asset_manifest, generated_artifact.content.manifest_validation is the deterministic harness authority for schema and screenplay coverage. Treat missing_required_keys / required_baseline_coverage as authoritative for script.asset_requirements coverage. screenplay IDs belong in source_requirement_keys and are NOT required to equal canonical_key; do not flag normalized char_*/scene_*/prop_* canonical keys merely because the screenplay uses CHAR_*/LOC_*/PROP_* IDs. Treat duplicate_canonical_semantic_check, illegal_asset_type_check, continuity_lock_check and typed_metadata_check as authoritative when present. If typed_metadata_check.status=pass, you MUST NOT claim that typed metadata fields are missing or require any new field names beyond typed_metadata_check.required_fields. In particular, physical_tags, social_register, lighting_mood, spatial_function, architectural_style, material, dimensions_hint and narrative_function are OPTIONAL unless the latest bound user instruction explicitly names them. continuity_lock is canonically encoded as an array of rule strings; if older user/director prose says continuity_lock=true/false, interpret that only as lock intent and never flag the array encoding as a deviation. Review the complete compact items list supplied by the harness rather than assuming it is truncated. You may still flag semantic/content-specific assets explicitly required by the bound instruction. Do not invent a target item count; an approximate expected count is diagnostic only. Never recommend regeneration merely to restore old costume/set taxonomy, screenplay IDs as manifest keys, boolean lock encoding, invented schema fields, or historical 10/12/14 counts when deterministic validation passes. "
     "For characters/scenes/props reviews, do not demand literal retention of a source-culture costume, interior or prop styling when the localized production is set in another target market. Accept an explicit source_visual_traits -> localized_visual_design mapping when narrative function, identity and continuity anchors are preserved. source_continuity_lock is an archival SOURCE field; continuity_lock / production_continuity_lock are the TARGET-MARKET production authority. If visual localization changes culturally specific styling, source_continuity_lock and continuity_lock should not be identical, and source-only styling must not be required downstream. When generated_artifact.content.continuity_localization_validation is present, treat its status/issues as deterministic harness evidence. generation_prompt_en is provider-facing English and is not required to match the story-language prose word-for-word."
-    "For reference_images reviews, generated_artifact.content.reference_validation is the deterministic harness authority for coverage, source-kind legality and planned-vs-actual combination bindings when present. Review the complete compact reference-items list supplied by the harness rather than inferring absence from a preview limit. asset_library_context and user-selected visual candidates are different stores; an empty thematic asset library does not negate selected upstream candidates. Canonical source_kind values are character, scene, prop and combination; combination source_id/source_ids may be arrays. Status/provenance wording is secondary to reference_validation and actual candidate bindings."
+    "For reference_images reviews, generated_artifact.content.reference_validation is the deterministic harness authority for coverage, source-kind legality and planned-vs-actual combination bindings when present. Review the complete compact reference-items list supplied by the harness rather than inferring absence from a preview limit. asset_library_context and user-selected visual candidates are different stores; an empty thematic asset library does not negate selected upstream candidates. Canonical source_kind values are character, scene, prop and combination; combination source_id/source_ids may be arrays. Status/provenance wording is secondary to reference_validation and actual candidate bindings. "
+    "For storyboard reviews, generated_artifact.content.storyboard_validation is the deterministic harness authority for shot count, index continuity, required per-shot fields, hydrated reference metadata and duration arithmetic when present. The generated_artifact.content.shots list supplied to you is the COMPLETE compact shot sequence and must never be assumed to stop at a generic preview limit. If storyboard_validation.status=pass, do not claim that tail shots are missing, that estimated_seconds disagrees with the duration sum, or that canonical reference entries lack candidate_id/url/source_kind when the harness hydration validation has already repaired them. You may still flag genuine semantic issues such as a missing story beat, wrong character/action, or a reference/continuity contradiction that is actually visible in the complete shots. Do not require a continuity_qa/review artifact as evidence for storyboard completion: storyboard regeneration invalidates that downstream QA by design, so QA closure belongs to the later review stage after dependent plans have been re-established."
+    "For dialogue_plan reviews, generated_artifact.content.dialogue_validation is the deterministic harness authority for one-to-one storyboard-shot coverage, shot-index continuity and basic dialogue/silent structural completeness. The generated_artifact.content.items list supplied to you is the COMPLETE compact dialogue sequence; never infer that shots after item 10 are missing from a generic preview limit. If dialogue_validation.status=pass, do not recommend regeneration solely for an alleged missing tail shot_index or wrong item count. You may still flag genuine semantic issues such as wrong approved wording, speaker identity, delivery intent or timing when supported by the complete artifact."
+    "For sound_plan reviews, generated_artifact.content.sound_validation is the deterministic harness authority for one-to-one storyboard-shot coverage and required sound-plan fields when present. The generated_artifact.content.items list supplied to you is the COMPLETE compact sound sequence; do not infer missing tail shots from a generic preview limit. If sound_validation.status=pass, do not recommend regeneration solely for an alleged item-count or tail-shot gap."
+    "For review-stage self-review, generated_artifact.content.checks and blocking_failures are supplied as complete compact lists. Treat actual fail checks and blocking_failures as the gating evidence. Do not invent missing QA checks because a generic preview would normally cap lists. A review artifact may legitimately recommend adjust_next_stage when the QA report itself is structurally sound but identifies genuine upstream blockers."
 )
 
 SEGMENT_ANALYSIS_TASK = (
@@ -345,6 +350,111 @@ class OpenAICompatibleProvider(WorkflowProvider):
         return compact
 
     @classmethod
+    def _compact_storyboard_shots(cls, value: Any) -> list[dict[str, Any]]:
+        """Return every storyboard shot in a review-safe compact form.
+
+        Storyboards are commonly longer than the generic preview cap. Truncating
+        them caused the director reviewer to see only the first ten shots and then
+        falsely report missing tail shots/beats. Keep the complete shot sequence,
+        while trimming verbose prompt/reference payloads so the review request
+        stays compact.
+        """
+        if not isinstance(value, list):
+            return []
+        compact: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            bindings = item.get("asset_bindings")
+            compact_bindings: dict[str, Any] = {}
+            if isinstance(bindings, dict):
+                for key in ("characters", "scenes", "scene", "props"):
+                    if key in bindings:
+                        compact_bindings[key] = bindings.get(key)
+                refs = bindings.get("reference_images")
+                if isinstance(refs, list):
+                    compact_bindings["reference_images"] = [
+                        {
+                            key: ref.get(key)
+                            for key in ("canonical_key", "candidate_id", "url", "source_kind")
+                            if key in ref
+                        }
+                        if isinstance(ref, dict) else ref
+                        for ref in refs
+                    ]
+            row: dict[str, Any] = {}
+            for key in (
+                "index", "duration_seconds", "scene", "story_beat",
+                "camera", "blocking", "continuity", "status",
+            ):
+                if key in item:
+                    row[key] = item.get(key)
+            if compact_bindings:
+                row["asset_bindings"] = compact_bindings
+            if item.get("visual_prompt") is not None:
+                prompt = str(item.get("visual_prompt") or "")
+                row["visual_prompt"] = prompt[:900] + ("…" if len(prompt) > 900 else "")
+            compact.append(row)
+        return compact
+
+    @classmethod
+    def _compact_dialogue_items(cls, value: Any) -> list[dict[str, Any]]:
+        """Return the complete dialogue-plan row set in a compact review form."""
+        if not isinstance(value, list):
+            return []
+        compact: list[dict[str, Any]] = []
+        fields = (
+            "shot_index", "status", "speaker_id", "dialogue_text", "text",
+            "language", "delivery_note", "timing", "subtitle",
+            "lip_sync_target", "lip_sync", "no_dialogue", "lines",
+            "dialogue_lines", "dialogue",
+        )
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            row = {key: item.get(key) for key in fields if key in item}
+            for key in ("dialogue_text", "text", "subtitle", "delivery_note"):
+                if key in row and isinstance(row[key], str) and len(row[key]) > 1000:
+                    row[key] = row[key][:1000] + "…"
+            compact.append(row)
+        return compact
+
+    @classmethod
+    def _compact_sound_items(cls, value: Any) -> list[dict[str, Any]]:
+        """Return every sound-plan row in a compact QA/review form."""
+        if not isinstance(value, list):
+            return []
+        fields = (
+            "shot_index", "status", "ambience", "foley", "foley_events",
+            "cues", "sound_cues", "ducking", "dialogue_ducking",
+            "ducking_plan", "negative_audio", "negative_audio_constraints",
+            "scene_acoustics", "notes",
+        )
+        compact: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            compact.append({key: item.get(key) for key in fields if key in item})
+        return compact
+
+    @classmethod
+    def _compact_review_checks(cls, value: Any) -> list[dict[str, Any]]:
+        """Keep the complete QA checklist while dropping unrelated verbose fields."""
+        if not isinstance(value, list):
+            return []
+        fields = (
+            "name", "status", "evidence", "owner", "remediation",
+            "suggested_adjustment", "details", "finding",
+        )
+        compact: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                compact.append({key: item.get(key) for key in fields if key in item})
+            else:
+                compact.append({"name": str(item)})
+        return compact
+
+    @classmethod
     def _compact_asset_requirements(cls, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
@@ -382,7 +492,7 @@ class OpenAICompatibleProvider(WorkflowProvider):
             "continuity_rules", "adaptation_notes", "open_questions",
             "source_fact_register", "adaptation_decisions", "asset_requirements",
             "items", "manifest_validation", "shots", "checks", "blocking_failures", "status", "note",
-            "estimated_seconds", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed"
+            "estimated_seconds", "storyboard_validation", "dialogue_validation", "sound_validation", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed"
         ):
             if key not in content:
                 continue
@@ -391,6 +501,16 @@ class OpenAICompatibleProvider(WorkflowProvider):
                 value = cls._compact_manifest_items(value)
             elif key == "items" and kind == "reference_images":
                 value = cls._compact_reference_items(value)
+            elif key == "shots" and kind == "storyboard":
+                value = cls._compact_storyboard_shots(value)
+            elif key == "items" and kind == "dialogue_plan":
+                value = cls._compact_dialogue_items(value)
+            elif key == "items" and kind == "sound_plan":
+                value = cls._compact_sound_items(value)
+            elif key == "checks" and kind == "review":
+                value = cls._compact_review_checks(value)
+            elif key == "blocking_failures" and kind == "review":
+                value = list(value) if isinstance(value, list) else value
             elif key == "asset_requirements":
                 value = cls._compact_asset_requirements(value)
             elif isinstance(value, list):
@@ -418,7 +538,8 @@ class OpenAICompatibleProvider(WorkflowProvider):
                 keys = [
                     "logline", "source_summary", "title", "language", "target_market",
                     "beats", "scenes", "items", "shots", "checks", "blocking_failures",
-                    "status", "note", "estimated_seconds",
+                    "status", "note", "estimated_seconds", "reference_validation",
+                    "storyboard_validation", "dialogue_validation", "sound_validation",
                 ]
                 if stage == "asset_manifest":
                     keys.extend(["continuity_rules", "asset_requirements", "manifest_validation"])
@@ -428,6 +549,18 @@ class OpenAICompatibleProvider(WorkflowProvider):
                     value = content[key]
                     if key == "items" and kind == "asset_manifest":
                         value = cls._compact_manifest_items(value)
+                    elif key == "items" and kind == "reference_images":
+                        value = cls._compact_reference_items(value)
+                    elif key == "shots" and kind == "storyboard":
+                        value = cls._compact_storyboard_shots(value)
+                    elif key == "items" and kind == "dialogue_plan":
+                        value = cls._compact_dialogue_items(value)
+                    elif key == "items" and kind == "sound_plan":
+                        value = cls._compact_sound_items(value)
+                    elif key == "checks" and kind == "review":
+                        value = cls._compact_review_checks(value)
+                    elif key == "blocking_failures" and kind == "review":
+                        value = list(value) if isinstance(value, list) else value
                     elif key == "asset_requirements":
                         value = cls._compact_asset_requirements(value)
                     elif isinstance(value, list):

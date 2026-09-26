@@ -1,0 +1,6 @@
+1. Fully stop and restart Harness, then Ctrl+F5 the browser.
+2. Open the reference_images stage where binding state already shows isolated complete, combinations complete, Harness validation pass.
+3. Confirm Phase B cards now display their recovered images instead of “暂无候选”.
+4. If cards still use artifact-only fallback, click “同步当前采用绑定（不重画）” once. This creates the next metadata-only revision and hydrates current-revision candidate rows without calling Seedream.
+5. Open one Phase B card. The recovered image must be visible in the detail modal.
+6. Do not regenerate images merely to restore previews.

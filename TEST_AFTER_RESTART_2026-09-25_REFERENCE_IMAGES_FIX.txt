@@ -1,0 +1,14 @@
+覆盖并完全重启后：
+
+1. 不要回退角色/场景/道具；确认它们当前采用图仍在。
+2. 回到“参考图”。当前 rev1 是旧逻辑产物，建议按当前节点重新生成一次 reference_images。
+3. 新版总管不应再因为 asset_library_context 为空而声称“没有已采用视觉候选”。
+4. 对本 EP02 当前要求，预期：
+   - isolated: 14/14（5 character + 5 scene + 4 prop）
+   - combinations: 7/7
+   - total items: 21
+   - Seedream 新调用主要用于 7 张组合图；14 张上游已采用图应直接复用，不重新烧图。
+5. 参考图阶段顶部应先显示缩略图总览和“参考图绑定状态”。
+6. 点击任一组合图 -> 弹窗详情 -> 写局部要求 -> “抽 1 张”，应生成 reference_images 候选并可确认采用。
+7. 组合 item 的 source_kind 应为 combination；isolated 应为 character/scene/prop（singular）。
+8. 所有组合确认后再进入 storyboard。

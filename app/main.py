@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from .agents import AGENT_SPECS, STAGE_AGENTS, STAGE_GUIDANCE_HINTS
 from .config import settings
-from .db import Database
+from .db import Database, utcnow
 from .orchestrator import GATES, STAGE_LABELS, STAGES, OrchestrationError, Orchestrator
 
 
@@ -825,6 +825,58 @@ def select_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, An
     return {"candidate": selected, "downstream_invalidated": invalidated}
 
 
+@app.post("/api/workspaces/{workspace_id}/asset-candidates/{candidate_id}/unselect")
+def unselect_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, Any]:
+    """Release a candidate from production-truth selection without deleting it.
+
+    Selection is an adoption pointer, not a generation lock.  Unlocking keeps the
+    image as a normal candidate so the user can compare, adjust, re-select, or
+    delete it later.  Downstream artifacts are invalidated because their visual
+    authority may have changed.
+    """
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    candidate = db.get_asset_candidate(candidate_id)
+    if not candidate or str(candidate.get("workspace_id") or "") != workspace_id:
+        raise HTTPException(404, "Asset candidate not found")
+
+    stage = str(candidate.get("stage") or "")
+    canonical_key = str(candidate.get("canonical_key") or "")
+    artifact, _ = _current_stage_asset(workspace_id, stage, canonical_key)
+    if int(candidate.get("artifact_revision") or 0) != int(artifact.get("revision") or 0):
+        raise HTTPException(409, "该候选图属于旧版本资产，不能修改当前 revision 的采用状态")
+
+    if candidate.get("selected"):
+        now = utcnow()
+        # Keep this tiny mutation here so the delta does not need to overwrite db.py.
+        # Database.select_asset_candidate already enforces one selected row per
+        # canonical asset; this is the inverse operation for an explicit unlock.
+        with db._lock, db.connect() as conn:
+            conn.execute(
+                "UPDATE asset_candidates SET selected=0, updated_at=? WHERE id=? AND workspace_id=?",
+                (now, candidate_id, workspace_id),
+            )
+        candidate = db.get_asset_candidate(candidate_id) or candidate
+
+    invalidated = orchestrator.invalidate_downstream(workspace_id, stage)
+    if invalidated:
+        db.clear_stage_reviews(workspace_id, invalidated)
+        for gate_stage, gate_name in GATES.items():
+            if gate_stage in invalidated:
+                db.set_approval(workspace_id, gate_name, "pending", "视觉采用已解除，等待重新确认")
+    db.add_event(
+        workspace_id,
+        "asset_candidate.unselected",
+        {
+            "stage": stage,
+            "canonical_key": canonical_key,
+            "candidate_id": candidate_id,
+            "downstream_invalidated": invalidated,
+        },
+    )
+    return {"candidate": candidate, "downstream_invalidated": invalidated}
+
+
 @app.delete("/api/workspaces/{workspace_id}/asset-candidates/{candidate_id}")
 def delete_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, Any]:
     existing = db.get_asset_candidate(candidate_id)
@@ -944,6 +996,54 @@ def regenerate_stage(
         "memory_preserved": bool(prepared.get("memory_preserved")),
         "conversation_preserved": bool(prepared.get("conversation_preserved")),
     }
+
+
+@app.post("/api/workspaces/{workspace_id}/storyboard/revalidate")
+def revalidate_storyboard(workspace_id: str) -> dict[str, Any]:
+    """Re-run deterministic storyboard validation/review without new creative generation."""
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    try:
+        return orchestrator.revalidate_storyboard(workspace_id)
+    except OrchestrationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/dialogue-plan/revalidate")
+def revalidate_dialogue_plan(workspace_id: str) -> dict[str, Any]:
+    """Re-run deterministic dialogue-plan validation/review without new generation."""
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    try:
+        return orchestrator.revalidate_dialogue_plan(workspace_id)
+    except OrchestrationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/sound-plan/revalidate")
+def revalidate_sound_plan(workspace_id: str) -> dict[str, Any]:
+    """Re-run deterministic sound-plan validation/review without new generation."""
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    try:
+        return orchestrator.revalidate_sound_plan(workspace_id)
+    except OrchestrationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/reference-images/reconcile-bindings")
+def reconcile_reference_image_bindings(workspace_id: str) -> dict[str, Any]:
+    """Synchronize reference bindings to current selected upstream candidates.
+
+    This is a metadata-only operation: it never calls the director or image
+    provider and never redraws reference images.
+    """
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    try:
+        return orchestrator.reconcile_reference_image_bindings(workspace_id)
+    except OrchestrationError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.post("/api/workspaces/{workspace_id}/guidance/{stage}/chat")

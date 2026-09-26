@@ -1,0 +1,24 @@
+覆盖并完全重启 Harness 后：
+
+1. 不重跑角色、场景、道具。
+2. 回到“参考图”。
+3. 当前 rev2 是旧算法产物，需要再生成一次 reference_images（预计 rev3）。
+4. 使用当前已经绑定的 reference 要求；不要新增任何纯角色/纯场景/纯道具组合。
+5. 如果需要输入反馈，可只写：
+   “按当前已绑定要求重新执行；只生成用户明确用 + 列出的关系组合，以 Harness reference_validation 为结构验收依据。”
+6. 点击黄色“反馈并重新生成参考图”。
+
+期望：
+- Phase A 显示全部上游已采用 isolated refs。
+- Phase B 只显示用户明确绑定的 relationship combinations。
+- 不应再出现“全部角色合一张”“全部场景合一张”“全部道具合一张”等自动组合。
+- reference_validation.status = pass。
+- 总管不能再因为只看到前 10 项而声称后续 items 缺失。
+- Phase A 完整后默认折叠；优先检查 Phase B。
+
+若仍失败，请查看 reference_validation 的：
+- missing_planned_combinations
+- unexpected_combinations
+- invalid_source_kinds
+- duplicate_reference_keys
+而不是只看总管自然语言复盘。

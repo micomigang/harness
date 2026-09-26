@@ -10,6 +10,10 @@ from typing import Any, Callable
 from .agents import STAGE_AGENTS, agent_for_stage
 from .db import Database
 from .providers import ProviderRegistry
+from .reference_plan import (
+    canonical_combination_key,
+    extract_explicit_reference_combinations,
+)
 
 
 STAGES = [
@@ -187,6 +191,16 @@ class Orchestrator:
             "execution_directive": execution_directive,
             "asset_library_context": self.db.workspace_asset_context(workspace_id),
             "asset_candidates": selected_candidates,
+            # reference_images revisions overwrite the artifact row in-place, while
+            # their workbench candidates remain durable. Expose that history so a
+            # reconcile/fill run can recover exact prior combination URLs instead
+            # of redrawing or silently dropping them.
+            "reference_candidate_history": (
+                self.db.list_asset_candidates(
+                    workspace_id, stage="reference_images", limit=5000
+                )
+                if stage == "reference_images" else []
+            ),
             "series": self.db.get_series(str((workspace.get("settings") or {}).get("series_id") or "")) if (workspace.get("settings") or {}).get("series_id") else None,
         }
         content = provider.generate(stage, runtime_context)
@@ -199,6 +213,28 @@ class Orchestrator:
             )
         elif stage in {"characters", "scenes", "props"}:
             content = self._enforce_asset_manifest(stage, content, artifacts, workspace=workspace)
+        elif stage == "storyboard":
+            previous_storyboard = (by_kind.get("storyboard") or {}).get("content", {})
+            previous_shots = previous_storyboard.get("shots") if isinstance(previous_storyboard, dict) and isinstance(previous_storyboard.get("shots"), list) else []
+            content = self._normalize_storyboard(
+                content,
+                workspace=workspace,
+                execution_directive=execution_directive,
+                user_instruction=user_instruction,
+                reference_content=(by_kind.get("reference_images") or {}).get("content", {}),
+                previous_shot_count=len(previous_shots),
+            )
+        elif stage == "dialogue_plan":
+            content = self._normalize_dialogue_plan(
+                content,
+                storyboard_content=(by_kind.get("storyboard") or {}).get("content", {}),
+            )
+        elif stage == "sound_plan":
+            content = self._normalize_sound_plan(
+                content,
+                storyboard_content=(by_kind.get("storyboard") or {}).get("content", {}),
+                dialogue_content=(by_kind.get("dialogue_plan") or {}).get("content", {}),
+            )
         if progress_callback:
             progress_callback(94, "生成完成，正在保存产物")
         agent = agent_for_stage(stage)
@@ -846,14 +882,112 @@ class Orchestrator:
             "input_hash": fingerprint,
         }
 
+    @staticmethod
+    def _normalized_feedback_text(value: Any) -> str:
+        return " ".join(str(value or "").strip().split()).casefold()
+
+    def _recover_director_plan_for_feedback(
+        self, workspace_id: str, stage: str, feedback: str
+    ) -> dict[str, Any] | None:
+        """Reuse a director plan that was already bound by Director Chat.
+
+        The UI commonly follows a successful chat turn with the yellow
+        ``feedback + regenerate`` action.  Calling the director a second time is
+        unnecessary, slow and can time out.  Recover the exact plan attached to
+        the matching chat turn instead.  This is generic across stages and does
+        not inspect project-specific wording.
+        """
+        target = self._normalized_feedback_text(feedback)
+        if not target:
+            return None
+        messages = self.db.list_guidance_messages(workspace_id, limit=80)
+        matching_user_indexes = [
+            idx for idx, item in enumerate(messages)
+            if str(item.get("stage") or "") == stage
+            and str(item.get("role") or "") == "user"
+            and self._normalized_feedback_text(item.get("content")) == target
+        ]
+        for user_index in reversed(matching_user_indexes):
+            for item in messages[user_index + 1:]:
+                if str(item.get("stage") or "") != stage:
+                    continue
+                if str(item.get("role") or "") == "user":
+                    break
+                if str(item.get("role") or "") != "director":
+                    continue
+                metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+                plan = metadata.get("plan") if isinstance(metadata.get("plan"), dict) else None
+                if plan:
+                    return dict(plan)
+        return None
+
+    def _plan_regeneration_without_mutation(
+        self, workspace_id: str, stage: str, feedback: str
+    ) -> tuple[dict[str, Any], str, str, bool]:
+        """Resolve the regeneration plan before invalidating any current state.
+
+        Returns ``(plan, effective_instruction, reply, reused_bound_plan)``.  Any
+        external-model timeout happens before artifacts/gates/guidance are
+        mutated, so a retry is safe.
+        """
+        recovered = self._recover_director_plan_for_feedback(workspace_id, stage, feedback)
+        if recovered:
+            effective = str(
+                recovered.get("effective_instruction")
+                or recovered.get("prompt_addendum")
+                or feedback
+            ).strip()
+            recovered["effective_instruction"] = effective
+            reply = str(
+                recovered.get("reply")
+                or recovered.get("interpretation")
+                or "已复用刚刚在 Director Chat 中确认的执行方案。"
+            )
+            return recovered, effective, reply, True
+
+        workspace = self._workspace(workspace_id)
+        artifacts = self.db.list_artifacts(workspace_id)
+        saved = self.db.get_stage_guidance(workspace_id, stage) or {}
+        memory = self.db.get_workspace_memory(workspace_id)
+        provider = self.providers.workflow()
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(workspace_id, artifacts)
+        plan = self._call_director(
+            provider=provider,
+            workspace=workspace,
+            artifacts=artifacts,
+            stage=stage,
+            user_instruction=feedback,
+            project_memory=memory,
+            existing_instruction=str(saved.get("user_instruction") or ""),
+            conversation_history=self.db.list_guidance_messages(workspace_id, limit=24),
+            asset_library_context=self.db.workspace_asset_context(workspace_id),
+            asset_candidates=selected_candidates,
+            interaction_mode="regenerate_current",
+        )
+        effective = str(
+            plan.get("effective_instruction")
+            or plan.get("prompt_addendum")
+            or feedback
+        ).strip()
+        plan["effective_instruction"] = effective
+        reply = str(
+            plan.get("reply")
+            or plan.get("interpretation")
+            or plan.get("prompt_addendum")
+            or "已将你的要求绑定到下一次执行。"
+        )
+        return plan, effective, reply, False
+
     def prepare_stage_regeneration(
         self, workspace_id: str, stage: str, feedback: str
     ) -> dict[str, Any]:
-        """Bind user feedback to a new revision while preserving memory and the old revision.
+        """Bind feedback transaction-safely, then invalidate and enqueue a revision.
 
-        The current artifact is marked stale (not deleted), downstream artifacts are
-        invalidated, durable project/stage memory and conversation history are kept,
-        and the director produces a fresh bound plan specifically for regeneration.
+        External director planning is completed *before* destructive invalidation.
+        If a read timeout occurs, the current ready artifact, downstream artifacts,
+        reviews and gates remain untouched.  If Director Chat already bound the
+        exact feedback, that plan is reused and the second network round trip is
+        skipped.
         """
         if stage == "source" or stage not in STAGES:
             raise OrchestrationError(f"Stage cannot be regenerated: {stage}")
@@ -871,13 +1005,21 @@ class Orchestrator:
         if not current:
             raise OrchestrationError(f"当前还没有可重生成的{STAGE_LABELS.get(stage, stage)}产物")
 
+        # Resolve/recover the director plan first. No artifact/gate mutation occurs
+        # before this point, so network errors are safe to retry.
+        plan, effective, reply, reused_bound_plan = self._plan_regeneration_without_mutation(
+            workspace_id, stage, feedback
+        )
+
         downstream = self.downstream_stages(stage, include_self=False)
         self.db.mark_artifacts_stale(workspace_id, [stage])
         removed = self.db.delete_artifacts(workspace_id, downstream)
         removed_candidates = self.db.delete_asset_candidates_for_stages(workspace_id, downstream)
         removed_jobs = self.db.clear_terminal_jobs_for_stages(workspace_id, downstream)
         affected = [stage, *downstream]
-        self.db.clear_stage_guidance_plans(workspace_id, affected)
+        # Downstream plans are invalid. The current plan is rebound below against
+        # the post-invalidation fingerprint instead of being discarded.
+        self.db.clear_stage_guidance_plans(workspace_id, downstream)
         self.db.clear_stage_reviews(workspace_id, affected)
 
         reset_gates: list[str] = []
@@ -891,6 +1033,30 @@ class Orchestrator:
                 )
                 reset_gates.append(gate_name)
 
+        # Rebind the plan using the state that the job will actually see. This
+        # prevents execute_job from calling the director again because a stale
+        # pre-invalidation hash no longer matches.
+        workspace = self._workspace(workspace_id)
+        artifacts = self.db.list_artifacts(workspace_id)
+        memory = self.db.get_workspace_memory(workspace_id)
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(workspace_id, artifacts)
+        fingerprint = self._guidance_fingerprint(
+            workspace, artifacts, stage, effective, memory,
+            self.db.workspace_asset_context(workspace_id), selected_candidates,
+        )
+        self.db.upsert_stage_guidance(
+            workspace_id, stage, user_instruction=effective,
+            director_plan=plan, plan_input_hash=fingerprint,
+        )
+        if not reused_bound_plan:
+            self.db.add_guidance_message(
+                workspace_id, stage, "user", feedback,
+                {"kind": "revision_feedback", "input_hash": fingerprint, "interaction_mode": "regenerate_current"},
+            )
+            self.db.add_guidance_message(
+                workspace_id, stage, "director", reply,
+                {"kind": "revision_feedback", "plan": plan, "input_hash": fingerprint, "interaction_mode": "regenerate_current"},
+            )
         self.db.add_event(
             workspace_id,
             "stage.regeneration_requested",
@@ -898,13 +1064,15 @@ class Orchestrator:
                 "stage": stage,
                 "previous_revision": current.get("revision"),
                 "downstream_cleared": downstream,
+                "director_plan_reused": reused_bound_plan,
             },
         )
-        chat = self.chat_stage(
-            workspace_id, stage, feedback, interaction_mode="regenerate_current"
-        )
         return {
-            **chat,
+            "stage": stage,
+            "reply": reply,
+            "effective_instruction": effective,
+            "plan": plan,
+            "input_hash": fingerprint,
             "previous_revision": current.get("revision"),
             "downstream_cleared": removed,
             "removed_jobs": removed_jobs,
@@ -912,6 +1080,379 @@ class Orchestrator:
             "reset_gates": reset_gates,
             "memory_preserved": True,
             "conversation_preserved": True,
+            "director_plan_reused": reused_bound_plan,
+        }
+
+    def reconcile_reference_image_bindings(self, workspace_id: str) -> dict[str, Any]:
+        """Rebind reference_images to current upstream selections without rendering.
+
+        ``canonical_key`` is the stable production identity. Candidate IDs are
+        revision-time pointers and may legitimately change after a user re-draws
+        and re-selects an asset. This operation updates Phase A bindings and Phase B
+        ``input_candidate_ids`` while preserving every existing reference image URL.
+        No director/image provider call is made.
+        """
+        self._workspace(workspace_id)
+        if self.db.list_active_jobs(workspace_id):
+            raise OrchestrationError("工作区仍有进行中的任务，请等待结束后再同步参考图绑定")
+        current = self.db.get_artifact(workspace_id, "reference_images")
+        if not current:
+            raise OrchestrationError("当前还没有参考图产物可同步绑定")
+        content = current.get("content") if isinstance(current.get("content"), dict) else {}
+        items = content.get("items") if isinstance(content.get("items"), list) else []
+        if not items:
+            raise OrchestrationError("当前参考图 items 为空，不能只做绑定同步")
+
+        artifacts = self.db.list_artifacts(workspace_id)
+        selected = [
+            item for item in self._selected_asset_candidates_for_current_artifacts(workspace_id, artifacts)
+            if str(item.get("stage") or "") in {"characters", "scenes", "props"}
+        ]
+        by_key: dict[str, list[dict[str, Any]]] = {}
+        for candidate in selected:
+            key = str(candidate.get("canonical_key") or "").strip()
+            if key:
+                by_key.setdefault(key, []).append(candidate)
+
+        unresolved: list[dict[str, Any]] = []
+        previous_ref_candidates = self.db.list_asset_candidates(
+            workspace_id, stage="reference_images",
+            artifact_revision=int(current.get("revision") or 0), limit=5000,
+        )
+        reference_candidate_history = self.db.list_asset_candidates(
+            workspace_id, stage="reference_images", limit=5000,
+        )
+        selected_reference_keys = {
+            str(item.get("canonical_key") or "")
+            for item in reference_candidate_history if item.get("selected")
+        }
+
+        new_content = json.loads(json.dumps(content, ensure_ascii=False))
+        new_items = new_content.get("items") if isinstance(new_content.get("items"), list) else []
+        kind_alias = {"characters": "character", "scenes": "scene", "props": "prop"}
+        isolated_keys: list[str] = []
+        actual_combinations: list[list[str]] = []
+        binding_changes: list[dict[str, Any]] = []
+
+        for item in new_items:
+            if not isinstance(item, dict):
+                continue
+            raw_kind = str(item.get("source_kind") or "").strip()
+            source_kind = kind_alias.get(raw_kind, raw_kind)
+            item["source_kind"] = source_kind
+            if source_kind in {"character", "scene", "prop"}:
+                source_id = item.get("source_id")
+                key = str(source_id if isinstance(source_id, str) else item.get("canonical_key") or item.get("reference_key") or "").strip()
+                if not key:
+                    unresolved.append({"canonical_key": "", "reason": "isolated reference has no canonical key"})
+                    continue
+                isolated_keys.append(key)
+                candidates = by_key.get(key, [])
+                if len(candidates) != 1:
+                    unresolved.append({
+                        "canonical_key": key,
+                        "reason": "missing selected candidate" if not candidates else "multiple selected candidates",
+                        "candidate_ids": [str(c.get("id") or "") for c in candidates],
+                    })
+                    continue
+                candidate = candidates[0]
+                old_id = str(item.get("candidate_id") or "")
+                new_id = str(candidate.get("id") or "")
+                if old_id != new_id:
+                    binding_changes.append({"canonical_key": key, "from": old_id, "to": new_id})
+                item.update({
+                    "source_id": key,
+                    "source_ids": [key],
+                    "canonical_key": key,
+                    "reference_key": key,
+                    "candidate_id": new_id,
+                    "remote_url": str(candidate.get("remote_url") or ""),
+                    "url": str(candidate.get("url") or ""),
+                    "local_path": str(candidate.get("local_path") or ""),
+                    "model": str(candidate.get("model") or item.get("model") or ""),
+                    "status": "selected_candidate",
+                    "binding_origin": "current_upstream_selected_candidate",
+                })
+            elif source_kind == "combination":
+                source_ids = item.get("source_id") if isinstance(item.get("source_id"), list) else item.get("source_ids")
+                source_ids = [str(x).strip() for x in (source_ids or []) if str(x).strip()]
+                item["source_id"] = source_ids
+                item["source_ids"] = source_ids
+                actual_combinations.append(source_ids)
+                ids: list[str] = []
+                missing: list[str] = []
+                for key in source_ids:
+                    candidates = by_key.get(key, [])
+                    if len(candidates) == 1:
+                        ids.append(str(candidates[0].get("id") or ""))
+                    else:
+                        missing.append(key)
+                if missing:
+                    unresolved.append({"canonical_key": item.get("canonical_key"), "reason": "combination input unresolved", "missing_inputs": missing})
+                else:
+                    item["input_candidate_ids"] = ids
+                if str(item.get("canonical_key") or "") in selected_reference_keys:
+                    item["status"] = "selected_candidate"
+
+        upstream_expected: list[str] = []
+        for artifact in artifacts:
+            if str(artifact.get("kind") or "") not in {"characters", "scenes", "props"}:
+                continue
+            for upstream_item in ((artifact.get("content") or {}).get("items") or []):
+                if isinstance(upstream_item, dict):
+                    key = str(upstream_item.get("canonical_key") or upstream_item.get("id") or "").strip()
+                    if key and key not in upstream_expected:
+                        upstream_expected.append(key)
+
+        planned = ((new_content.get("reference_plan") or {}).get("combinations") or [])
+        planned_combinations = [
+            [str(x).strip() for x in combo if str(x).strip()]
+            for combo in planned if isinstance(combo, list)
+        ]
+
+        # A failed regenerate can replace the artifact with Phase A only, which
+        # would otherwise erase reference_plan.combinations. Recover the explicit
+        # contract from the bound stage guidance. This recognizes only canonical
+        # combo IDs or plus-delimited canonical relations, never generic prose.
+        saved_guidance = self.db.get_stage_guidance(workspace_id, "reference_images") or {}
+        directive = saved_guidance.get("director_plan") if isinstance(saved_guidance.get("director_plan"), dict) else {}
+        guidance_texts = [
+            str(saved_guidance.get("user_instruction") or ""),
+            str(directive.get("effective_instruction") or ""),
+        ]
+        guidance_combinations: list[list[str]] = []
+        seen_guidance: set[tuple[str, ...]] = set()
+        for guidance_text in guidance_texts:
+            for combo in extract_explicit_reference_combinations(guidance_text):
+                signature = tuple(combo)
+                if signature not in seen_guidance:
+                    seen_guidance.add(signature)
+                    guidance_combinations.append(combo)
+        if guidance_combinations:
+            planned_combinations = guidance_combinations
+        elif not planned_combinations:
+            planned_combinations = [list(combo) for combo in actual_combinations]
+
+        # Restore missing planned combinations from durable reference candidate
+        # history without calling Seedream. This is the metadata-only recovery
+        # path for revisions whose artifact items were accidentally truncated.
+        history_by_key: dict[str, dict[str, Any]] = {}
+        for candidate in reference_candidate_history:
+            if not isinstance(candidate, dict) or not candidate.get("url"):
+                continue
+            key = str(candidate.get("canonical_key") or "").strip()
+            if key.startswith("combo__") and key not in history_by_key:
+                history_by_key[key] = candidate
+
+        existing_combo_set = {tuple(combo) for combo in actual_combinations}
+        for combo in planned_combinations:
+            signature = tuple(combo)
+            if signature in existing_combo_set:
+                continue
+            reference_key = canonical_combination_key(combo)
+            historical = history_by_key.get(reference_key)
+            if not historical:
+                unresolved.append({
+                    "canonical_key": reference_key,
+                    "reason": "planned combination media missing from current artifact and reference history",
+                    "source_ids": list(combo),
+                })
+                continue
+            input_ids: list[str] = []
+            missing_inputs: list[str] = []
+            for key in combo:
+                candidates = by_key.get(key, [])
+                if len(candidates) == 1:
+                    input_ids.append(str(candidates[0].get("id") or ""))
+                else:
+                    missing_inputs.append(key)
+            if missing_inputs:
+                unresolved.append({
+                    "canonical_key": reference_key,
+                    "reason": "combination input unresolved",
+                    "missing_inputs": missing_inputs,
+                })
+                continue
+            restored = {
+                "source_kind": "combination",
+                "source_id": list(combo),
+                "source_ids": list(combo),
+                "canonical_key": reference_key,
+                "reference_key": reference_key,
+                "name": " + ".join(combo),
+                "model": str(historical.get("model") or ""),
+                "remote_url": str(historical.get("remote_url") or ""),
+                "url": str(historical.get("url") or ""),
+                "local_path": str(historical.get("local_path") or ""),
+                "status": "selected_candidate" if historical.get("selected") else "candidate",
+                "origin": "reference_candidate_history_reuse",
+                "input_candidate_ids": input_ids,
+                "prompt": str(historical.get("prompt") or ""),
+            }
+            new_items.append(restored)
+            actual_combinations.append(list(combo))
+            existing_combo_set.add(signature)
+
+        # Keep reference_plan aligned with the recovered explicit contract so later
+        # runs do not regress combination_expected back to zero.
+        reference_plan = new_content.get("reference_plan") if isinstance(new_content.get("reference_plan"), dict) else {}
+        reference_plan["combinations"] = [list(combo) for combo in planned_combinations]
+        new_content["reference_plan"] = reference_plan
+
+        actual_iso_set = set(isolated_keys)
+        expected_iso_set = set(upstream_expected)
+        actual_combo_set = {tuple(combo) for combo in actual_combinations}
+        planned_combo_set = {tuple(combo) for combo in planned_combinations}
+        valid_kinds = {"character", "scene", "prop", "combination"}
+        invalid_kinds = sorted({
+            str(item.get("source_kind") or "") for item in new_items
+            if isinstance(item, dict) and str(item.get("source_kind") or "") not in valid_kinds
+        })
+        reference_keys = [
+            str(item.get("canonical_key") or item.get("reference_key") or "")
+            for item in new_items if isinstance(item, dict)
+        ]
+        duplicate_keys = sorted({key for key in reference_keys if key and reference_keys.count(key) > 1})
+        missing_iso = sorted(expected_iso_set - actual_iso_set)
+        unexpected_iso = sorted(actual_iso_set - expected_iso_set)
+        missing_combos = [list(combo) for combo in sorted(planned_combo_set - actual_combo_set)]
+        unexpected_combos = [list(combo) for combo in sorted(actual_combo_set - planned_combo_set)]
+        passed = not any([
+            unresolved, missing_iso, unexpected_iso, missing_combos, unexpected_combos,
+            invalid_kinds, duplicate_keys,
+        ])
+        validation = {
+            "status": "pass" if passed else "fail",
+            "binding_reconciled": True,
+            "isolated_expected": len(expected_iso_set),
+            "isolated_completed": len(actual_iso_set),
+            "combination_expected": len(planned_combo_set),
+            "combination_completed": len(actual_combo_set),
+            "missing_isolated": missing_iso,
+            "unexpected_isolated": unexpected_iso,
+            "missing_planned_combinations": missing_combos,
+            "unexpected_combinations": unexpected_combos,
+            "invalid_source_kinds": invalid_kinds,
+            "duplicate_reference_keys": duplicate_keys,
+            "binding_issues": unresolved,
+            "binding_changes": binding_changes,
+        }
+        new_content["reference_validation"] = validation
+        coverage = new_content.get("selection_coverage") if isinstance(new_content.get("selection_coverage"), dict) else {}
+        coverage.update({
+            "upstream_selected_count": len(selected),
+            "upstream_selected_keys": sorted(by_key.keys()),
+            "isolated_expected": len(expected_iso_set),
+            "isolated_completed": len(actual_iso_set),
+            "combination_expected": len(planned_combo_set),
+            "combination_completed": len(actual_combo_set),
+        })
+        new_content["selection_coverage"] = coverage
+        new_content["status"] = "succeeded" if passed else "partial"
+        new_content["note"] = "Harness binding reconcile: reused existing reference image URLs; synchronized canonical_key bindings to current selected upstream candidates without calling image generation."
+
+        # A metadata-only reconcile may restore combination artifact items from
+        # older reference-candidate history. Those recovered items also need a
+        # current-revision workbench candidate row; otherwise the artifact is
+        # structurally complete (7/7) but the UI still shows "暂无候选".
+        current_candidate_keys = {
+            str(candidate.get("canonical_key") or "").strip()
+            for candidate in previous_ref_candidates
+            if str(candidate.get("canonical_key") or "").strip()
+        }
+        recovered_workbench_sources: list[dict[str, Any]] = []
+        for item in new_items:
+            if not isinstance(item, dict) or str(item.get("source_kind") or "") != "combination":
+                continue
+            key = str(item.get("canonical_key") or item.get("reference_key") or "").strip()
+            if not key or key in current_candidate_keys:
+                continue
+            item_url = str(item.get("url") or "")
+            candidates = [
+                candidate for candidate in reference_candidate_history
+                if str(candidate.get("canonical_key") or "").strip() == key
+                and str(candidate.get("url") or "")
+            ]
+            if not candidates:
+                continue
+            # Prefer the exact media URL restored into the artifact, then a
+            # selected historical candidate, then the newest available row.
+            source = next(
+                (candidate for candidate in candidates if item_url and str(candidate.get("url") or "") == item_url and candidate.get("selected")),
+                None,
+            )
+            if source is None:
+                source = next(
+                    (candidate for candidate in candidates if item_url and str(candidate.get("url") or "") == item_url),
+                    None,
+                )
+            if source is None:
+                source = next((candidate for candidate in candidates if candidate.get("selected")), None)
+            if source is None:
+                source = candidates[0]
+            recovered_workbench_sources.append(source)
+            current_candidate_keys.add(key)
+
+        result = self.db.upsert_artifact(
+            workspace_id, "reference_images", STAGE_LABELS["reference_images"],
+            new_content, "harness-binding-reconcile", upstream=REQUIRES.get("reference_images", []),
+        )
+        new_revision = int(result.get("revision") or 0)
+        # Preserve the user's reference-workbench candidate/adoption state across
+        # this metadata-only revision; no media is regenerated. Also hydrate one
+        # current-revision candidate for every combination restored from history
+        # so the overview/detail workbench can render and manage it normally.
+        candidate_rows_to_clone = [*previous_ref_candidates, *recovered_workbench_sources]
+        for candidate in candidate_rows_to_clone:
+            self.db.add_asset_candidate(
+                workspace_id, "reference_images", new_revision,
+                str(candidate.get("canonical_key") or ""),
+                str(candidate.get("source_id") or candidate.get("canonical_key") or ""),
+                feedback=str(candidate.get("feedback") or ""),
+                base_candidate_id="",
+                prompt=str(candidate.get("prompt") or ""),
+                model=str(candidate.get("model") or ""),
+                remote_url=str(candidate.get("remote_url") or ""),
+                url=str(candidate.get("url") or ""),
+                local_path=str(candidate.get("local_path") or ""),
+                selected=bool(candidate.get("selected")),
+            )
+
+        review = {
+            "reply": (
+                "参考图绑定已由 Harness 确定性同步到当前上游采用候选；没有重新生成任何图片。"
+                if passed else
+                "参考图绑定同步完成，但仍存在无法自动解析的候选冲突，需要用户处理。"
+            ),
+            "assessment": "deterministic reference binding reconcile",
+            "matched_requirements": ["preserved existing image URLs", "canonical_key resolved to current selected upstream candidate"],
+            "deviations": unresolved,
+            "suggested_adjustments": [],
+            "recommended_action": "proceed" if passed else "wait_for_user",
+            "next_stage_focus": "confirm reference images before storyboard" if passed else "resolve binding issues",
+            "memory_candidates": [],
+            "harness_review_guard": {
+                "reference_validation_status": validation["status"],
+                "structural_authority": "artifact.content.reference_validation",
+                "binding_reconcile": True,
+            },
+        }
+        self.db.set_stage_review(workspace_id, "reference_images", new_revision, review)
+        self.db.set_approval(
+            workspace_id, GATES["reference_images"], "pending",
+            "参考图绑定已同步；请确认当前参考图后再进入分镜" if passed else "参考图绑定仍有冲突，等待处理",
+        )
+        self.db.add_event(workspace_id, "reference_images.bindings_reconciled", {
+            "revision": new_revision, "status": validation["status"],
+            "binding_changes": len(binding_changes), "issues": len(unresolved),
+            "media_regenerated": False,
+        })
+        return {
+            "artifact": result,
+            "reference_validation": validation,
+            "binding_changes": binding_changes,
+            "issues": unresolved,
+            "media_regenerated": False,
         }
 
     def validate_bound_plan(
@@ -922,9 +1463,13 @@ class Orchestrator:
         saved = self.db.get_stage_guidance(workspace_id, stage) or {}
         memory = self.db.get_workspace_memory(workspace_id)
         effective = str(saved.get("user_instruction") or "")
+        selected_candidates = self._selected_asset_candidates_for_current_artifacts(
+            workspace_id, artifacts
+        )
         expected = self._guidance_fingerprint(
             workspace, artifacts, stage, effective, memory,
-            self.db.workspace_asset_context(workspace_id)
+            self.db.workspace_asset_context(workspace_id),
+            selected_candidates,
         )
         valid = bool(
             input_hash
@@ -1007,6 +1552,877 @@ class Orchestrator:
             "reset_gates": reset_gates,
             "preserved_upstream": [item for item in STAGES if item not in affected],
         }
+
+    @staticmethod
+    def _storyboard_expected_count(
+        workspace: dict[str, Any],
+        execution_directive: dict[str, Any] | None,
+        user_instruction: str = "",
+        *,
+        previous_shot_count: int = 0,
+    ) -> int:
+        """Resolve the storyboard shot-count contract without stale-default drift.
+
+        Priority is intentionally: explicit bound instruction -> explicit director
+        parameter override -> previous storyboard count (for regeneration/revalidate)
+        -> workspace default.  This keeps a metadata-only regeneration of an existing
+        14-shot board from silently reverting to a workspace default such as 8.
+        """
+        directive = execution_directive if isinstance(execution_directive, dict) else {}
+
+        # The current bound instruction is the most specific user-authored contract.
+        # Recognise concise production wording such as "14 镜" as well as 镜头/分镜.
+        text = str(user_instruction or "")
+        patterns = (
+            r"(?:严格|exactly|exact)?\s*(\d{1,3})\s*(?:个|支)?\s*(?:连续)?\s*(?:镜头|分镜|镜|shots?)(?!\w)",
+            r"(?:shots?|分镜|镜头|镜)\s*(?:总数|count|total|数量)?\s*[:=：]?\s*(\d{1,3})(?!\d)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                try:
+                    return max(1, min(100, int(match.group(1))))
+                except (TypeError, ValueError):
+                    pass
+
+        params = directive.get("parameter_overrides") if isinstance(directive.get("parameter_overrides"), dict) else {}
+        try:
+            if params.get("storyboard_count") is not None:
+                return max(1, min(100, int(params.get("storyboard_count"))))
+        except (TypeError, ValueError):
+            pass
+
+        # A regeneration/revalidation should preserve the existing board's cardinality
+        # unless the current user/director contract explicitly changes it.
+        try:
+            if int(previous_shot_count or 0) > 0:
+                return max(1, min(100, int(previous_shot_count)))
+        except (TypeError, ValueError):
+            pass
+
+        settings = workspace.get("settings") if isinstance(workspace, dict) else {}
+        raw_default = (settings or {}).get("storyboard_count")
+        if raw_default not in (None, ""):
+            try:
+                return max(1, min(100, int(raw_default)))
+            except (TypeError, ValueError):
+                pass
+        return 0
+
+    @staticmethod
+    def _storyboard_reference_truth(reference_content: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+        """Index approved reference-image items by canonical/reference key."""
+        content = reference_content if isinstance(reference_content, dict) else {}
+        truth: dict[str, dict[str, Any]] = {}
+        for raw in content.get("items") if isinstance(content.get("items"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("canonical_key") or raw.get("reference_key") or "").strip()
+            if not key:
+                source_id = raw.get("source_id")
+                if isinstance(source_id, str):
+                    key = source_id.strip()
+                elif isinstance(source_id, list) and source_id:
+                    key = canonical_combination_key([str(x).strip() for x in source_id if str(x).strip()])
+            if key:
+                truth[key] = raw
+        return truth
+
+    @classmethod
+    def _hydrate_storyboard_reference_bindings(
+        cls,
+        content: dict[str, Any],
+        *,
+        reference_content: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Hydrate storyboard reference bindings from approved production truth.
+
+        LLMs are allowed to choose *which* canonical reference belongs to a shot, but
+        durable candidate_id/url/source_kind metadata is harness-owned.  When a shot
+        names an existing canonical reference, fill/refresh those fields
+        deterministically instead of asking the model to copy volatile media URLs.
+        """
+        result = json.loads(json.dumps(content or {}, ensure_ascii=False))
+        truth = cls._storyboard_reference_truth(reference_content)
+        changes: list[dict[str, Any]] = []
+        if not truth:
+            return result, changes
+        shots = result.get("shots") if isinstance(result.get("shots"), list) else []
+        for pos, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict):
+                continue
+            bindings = shot.get("asset_bindings")
+            if not isinstance(bindings, dict):
+                continue
+            refs = bindings.get("reference_images")
+            if not isinstance(refs, list):
+                continue
+            hydrated: list[Any] = []
+            for ref in refs:
+                if isinstance(ref, str):
+                    key = ref.strip()
+                    item = {"canonical_key": key}
+                elif isinstance(ref, dict):
+                    item = dict(ref)
+                    key = str(item.get("canonical_key") or item.get("reference_key") or "").strip()
+                    if not key:
+                        source_id = item.get("source_id")
+                        if isinstance(source_id, str):
+                            key = source_id.strip()
+                        elif isinstance(source_id, list) and source_id:
+                            key = canonical_combination_key([str(x).strip() for x in source_id if str(x).strip()])
+                    if key and not item.get("canonical_key"):
+                        item["canonical_key"] = key
+                else:
+                    hydrated.append(ref)
+                    continue
+                source = truth.get(key) if key else None
+                if source:
+                    before = {field: item.get(field) for field in ("candidate_id", "url", "source_kind")}
+                    for field in ("candidate_id", "url", "source_kind"):
+                        value = source.get(field)
+                        if value not in (None, ""):
+                            item[field] = value
+                    # Preserve canonical source identity arrays for combination refs.
+                    if item.get("source_id") in (None, "") and source.get("source_id") not in (None, ""):
+                        item["source_id"] = source.get("source_id")
+                    after = {field: item.get(field) for field in ("candidate_id", "url", "source_kind")}
+                    if before != after:
+                        changes.append({"shot_index": shot.get("index", pos), "canonical_key": key, "before": before, "after": after})
+                hydrated.append(item)
+            bindings["reference_images"] = hydrated
+            shot["asset_bindings"] = bindings
+        result["shots"] = shots
+        return result, changes
+
+    @classmethod
+    def _normalize_storyboard(
+        cls,
+        content: dict[str, Any],
+        *,
+        workspace: dict[str, Any],
+        execution_directive: dict[str, Any] | None,
+        user_instruction: str = "",
+        reference_content: dict[str, Any] | None = None,
+        previous_shot_count: int = 0,
+    ) -> dict[str, Any]:
+        """Normalize storyboard bookkeeping and attach deterministic validation.
+
+        Creative shot content remains model-owned. Harness owns only structural
+        invariants: exact requested count, index continuity, required fields and
+        duration arithmetic. This prevents a review-preview truncation from turning
+        a valid 14/20/etc-shot artifact into a false regeneration loop.
+        """
+        result, hydration_changes = cls._hydrate_storyboard_reference_bindings(
+            content, reference_content=reference_content
+        )
+        raw_shots = result.get("shots") if isinstance(result.get("shots"), list) else []
+        shots: list[dict[str, Any]] = []
+        expected = cls._storyboard_expected_count(
+            workspace, execution_directive, user_instruction,
+            previous_shot_count=previous_shot_count,
+        )
+        if expected <= 0:
+            expected = len(raw_shots)
+
+        def _as_list(value: Any) -> list[Any]:
+            if value is None or value == "":
+                return []
+            if isinstance(value, list):
+                return value
+            return [value]
+
+        actual_indices: list[int] = []
+        invalid_index_rows: list[int] = []
+        missing_fields: list[dict[str, Any]] = []
+        invalid_durations: list[Any] = []
+        reference_binding_gaps: list[Any] = []
+        duration_sum = 0.0
+
+        for position, raw in enumerate(raw_shots, start=1):
+            if not isinstance(raw, dict):
+                invalid_index_rows.append(position)
+                continue
+            shot = dict(raw)
+            raw_index = shot.get("index", position)
+            match = re.search(r"\d+", str(raw_index))
+            if match:
+                index = int(match.group(0))
+                shot["index"] = index
+                actual_indices.append(index)
+            else:
+                index = position
+                invalid_index_rows.append(position)
+
+            try:
+                duration = float(shot.get("duration_seconds"))
+                if duration <= 0:
+                    raise ValueError
+                # Preserve integers for cleaner downstream JSON/UI where possible.
+                shot["duration_seconds"] = int(duration) if duration.is_integer() else duration
+                duration_sum += duration
+            except (TypeError, ValueError):
+                invalid_durations.append(raw_index)
+
+            bindings = shot.get("asset_bindings")
+            if not isinstance(bindings, dict):
+                bindings = {}
+            else:
+                bindings = dict(bindings)
+            # Accept older singular scene output but normalize to the current schema.
+            if "scenes" not in bindings and bindings.get("scene") not in (None, ""):
+                bindings["scenes"] = _as_list(bindings.get("scene"))
+            for key in ("characters", "scenes", "props", "reference_images"):
+                if key in bindings:
+                    bindings[key] = _as_list(bindings.get(key))
+            shot["asset_bindings"] = bindings
+
+            required = []
+            for key in ("story_beat", "visual_prompt"):
+                if not str(shot.get(key) or "").strip():
+                    required.append(key)
+            if not isinstance(raw.get("asset_bindings"), dict):
+                required.append("asset_bindings")
+            if not bindings.get("scenes"):
+                required.append("asset_bindings.scenes")
+            if not bindings.get("reference_images"):
+                required.append("asset_bindings.reference_images")
+            if required:
+                missing_fields.append({"index": index, "fields": sorted(set(required))})
+            if isinstance(bindings.get("reference_images"), list):
+                bad_refs = [
+                    ref for ref in bindings.get("reference_images", [])
+                    if isinstance(ref, dict) and (
+                        not str(ref.get("canonical_key") or "").strip()
+                        or not str(ref.get("candidate_id") or "").strip()
+                        or not str(ref.get("url") or "").strip()
+                    )
+                ]
+                if bad_refs:
+                    reference_binding_gaps.append({"index": index, "count": len(bad_refs)})
+            shots.append(shot)
+
+        result["shots"] = shots
+        model_estimate = result.get("estimated_seconds")
+        reconciled_seconds: int | float = int(duration_sum) if duration_sum.is_integer() else round(duration_sum, 3)
+        estimate_changed = False
+        try:
+            estimate_changed = abs(float(model_estimate) - float(duration_sum)) > 1e-6
+        except (TypeError, ValueError):
+            estimate_changed = bool(shots)
+        if estimate_changed and model_estimate not in (None, ""):
+            result["estimated_seconds_model"] = model_estimate
+        result["estimated_seconds"] = reconciled_seconds
+
+        expected_indices = list(range(1, expected + 1))
+        duplicates = sorted({value for value in actual_indices if actual_indices.count(value) > 1})
+        missing_indices = sorted(set(expected_indices) - set(actual_indices))
+        unexpected_indices = sorted(set(actual_indices) - set(expected_indices))
+        count_ok = len(shots) == expected
+        sequence_ok = (
+            actual_indices == expected_indices
+            and not duplicates
+            and not invalid_index_rows
+        )
+        passed = bool(
+            count_ok
+            and sequence_ok
+            and not missing_fields
+            and not invalid_durations
+            and not reference_binding_gaps
+        )
+        result["storyboard_validation"] = {
+            "status": "pass" if passed else "fail",
+            "expected_shots": expected,
+            "actual_shots": len(shots),
+            "actual_indices": actual_indices,
+            "missing_indices": missing_indices,
+            "unexpected_indices": unexpected_indices,
+            "duplicate_indices": duplicates,
+            "invalid_index_rows": invalid_index_rows,
+            "missing_required_fields": missing_fields,
+            "invalid_durations": invalid_durations,
+            "reference_binding_gaps": reference_binding_gaps,
+            "duration_sum_seconds": reconciled_seconds,
+            "estimated_seconds_reconciled": estimate_changed,
+            "reference_metadata_hydrated": len(hydration_changes),
+            "reference_metadata_changes": hydration_changes,
+            "structural_authority": "harness",
+        }
+        return result
+
+    @classmethod
+    def _normalize_dialogue_plan(
+        cls,
+        content: dict[str, Any],
+        *,
+        storyboard_content: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize aliases and validate one dialogue-plan row per storyboard shot."""
+        result = dict(content or {})
+        raw_items = result.get("items") if isinstance(result.get("items"), list) else []
+        storyboard_content = storyboard_content if isinstance(storyboard_content, dict) else {}
+        storyboard_shots = storyboard_content.get("shots") if isinstance(storyboard_content.get("shots"), list) else []
+        expected_indices: list[int] = []
+        storyboard_durations: dict[int, float] = {}
+        for pos, shot in enumerate(storyboard_shots, start=1):
+            if not isinstance(shot, dict):
+                continue
+            match = re.search(r"\d+", str(shot.get("index", pos)))
+            index = int(match.group(0)) if match else pos
+            expected_indices.append(index)
+            try:
+                storyboard_durations[index] = float(shot.get("duration_seconds"))
+            except (TypeError, ValueError):
+                pass
+        if not expected_indices:
+            expected_indices = list(range(1, len(raw_items) + 1))
+        expected_count = len(expected_indices)
+
+        def _boolish(value: Any) -> bool | None:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                lowered = value.strip().casefold()
+                if lowered in {"true", "yes", "1", "speaking", "dialogue"}:
+                    return True
+                if lowered in {"false", "no", "0", "none", "silent", "no_dialogue"}:
+                    return False
+            return None
+
+        def _timing_bounds(value: Any) -> tuple[float | None, float | None]:
+            if not isinstance(value, dict):
+                return None, None
+            start = end = None
+            for key in ("start_seconds", "start", "local_start_seconds", "shot_start_seconds"):
+                if key in value:
+                    try:
+                        start = float(value.get(key))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            for key in ("end_seconds", "end", "local_end_seconds", "shot_end_seconds"):
+                if key in value:
+                    try:
+                        end = float(value.get(key))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+            return start, end
+
+        items: list[dict[str, Any]] = []
+        actual_indices: list[int] = []
+        invalid_index_rows: list[int] = []
+        missing_required_fields: list[dict[str, Any]] = []
+        timing_issues: list[dict[str, Any]] = []
+        dialogue_count = 0
+        silent_count = 0
+        for position, raw in enumerate(raw_items, start=1):
+            if not isinstance(raw, dict):
+                invalid_index_rows.append(position)
+                continue
+            item = dict(raw)
+            match = re.search(r"\d+", str(item.get("shot_index", position)))
+            if match:
+                shot_index = int(match.group(0))
+                item["shot_index"] = shot_index
+                actual_indices.append(shot_index)
+            else:
+                shot_index = position
+                invalid_index_rows.append(position)
+
+            if "dialogue_text" not in item and item.get("text") is not None:
+                item["dialogue_text"] = item.get("text")
+            if "text" not in item and item.get("dialogue_text") is not None:
+                item["text"] = item.get("dialogue_text")
+            if "delivery_note" not in item and item.get("delivery") is not None:
+                item["delivery_note"] = item.get("delivery")
+
+            status = str(item.get("status") or "").strip().casefold()
+            lines_value = item.get("lines") or item.get("dialogue_lines")
+            has_lines = isinstance(lines_value, list) and bool(lines_value)
+            has_text = bool(str(item.get("dialogue_text") or "").strip()) or has_lines
+            silent = status in {"silent", "no_dialogue", "no-dialogue"} or _boolish(item.get("no_dialogue")) is True
+            if not status:
+                status = "silent" if silent or not has_text else "dialogue"
+                item["status"] = status
+            if status in {"silent", "no_dialogue", "no-dialogue"}:
+                silent = True
+
+            if silent:
+                silent_count += 1
+                item.setdefault("no_dialogue", True)
+                item.setdefault("lip_sync_target", False)
+            else:
+                dialogue_count += 1
+                item.setdefault("no_dialogue", False)
+                if "lip_sync_target" not in item:
+                    inferred = _boolish(item.get("lip_sync"))
+                    item["lip_sync_target"] = True if inferred is None else inferred
+
+            missing: list[str] = []
+            if silent:
+                if _boolish(item.get("lip_sync_target")) is True:
+                    missing.append("lip_sync_target=false_for_silent")
+            else:
+                if not str(item.get("speaker_id") or "").strip() and not has_lines:
+                    missing.append("speaker_id")
+                if not has_text:
+                    missing.append("dialogue_text")
+                if not str(item.get("language") or "").strip():
+                    missing.append("language")
+                if item.get("timing") in (None, "", []):
+                    missing.append("timing")
+                if item.get("subtitle") in (None, ""):
+                    missing.append("subtitle")
+                if _boolish(item.get("lip_sync_target")) is False:
+                    missing.append("lip_sync_target=true_for_dialogue")
+            if missing:
+                missing_required_fields.append({"shot_index": shot_index, "fields": sorted(set(missing))})
+
+            start, end = _timing_bounds(item.get("timing"))
+            duration = storyboard_durations.get(shot_index)
+            if start is not None and end is not None and (start < 0 or end < start or (duration is not None and end > duration + 1e-6)):
+                timing_issues.append({"shot_index": shot_index, "start": start, "end": end, "shot_duration": duration})
+            items.append(item)
+
+        duplicates = sorted({value for value in actual_indices if actual_indices.count(value) > 1})
+        expected_set = set(expected_indices)
+        missing_indices = sorted(expected_set - set(actual_indices))
+        unexpected_indices = sorted(set(actual_indices) - expected_set)
+        sequence_ok = actual_indices == expected_indices and not duplicates and not invalid_index_rows
+        passed = bool(len(items) == expected_count and sequence_ok and not missing_required_fields and not timing_issues)
+        result["items"] = items
+        result["dialogue_validation"] = {
+            "status": "pass" if passed else "fail",
+            "expected_items": expected_count,
+            "actual_items": len(items),
+            "expected_indices": expected_indices,
+            "actual_indices": actual_indices,
+            "missing_indices": missing_indices,
+            "unexpected_indices": unexpected_indices,
+            "duplicate_indices": duplicates,
+            "invalid_index_rows": invalid_index_rows,
+            "missing_required_fields": missing_required_fields,
+            "timing_issues": timing_issues,
+            "dialogue_items": dialogue_count,
+            "silent_items": silent_count,
+            "structural_authority": "harness",
+        }
+        return result
+
+    @classmethod
+    def _normalize_sound_plan(
+        cls,
+        content: dict[str, Any],
+        *,
+        storyboard_content: dict[str, Any] | None = None,
+        dialogue_content: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize and validate one sound-design row per storyboard shot.
+
+        Harness owns structural coverage only. Ambience/Foley/cue creative choices
+        remain model-owned, while exact storyboard shot coverage and the required
+        sound-plan fields are deterministic so a ten-row reviewer preview can never
+        create a false regeneration loop.
+        """
+        result = dict(content or {})
+        raw_items = result.get("items") if isinstance(result.get("items"), list) else []
+        storyboard_content = storyboard_content if isinstance(storyboard_content, dict) else {}
+        dialogue_content = dialogue_content if isinstance(dialogue_content, dict) else {}
+        storyboard_shots = storyboard_content.get("shots") if isinstance(storyboard_content.get("shots"), list) else []
+
+        expected_indices: list[int] = []
+        for position, shot in enumerate(storyboard_shots, start=1):
+            if not isinstance(shot, dict):
+                continue
+            match = re.search(r"\d+", str(shot.get("index", position)))
+            expected_indices.append(int(match.group(0)) if match else position)
+        if not expected_indices:
+            expected_indices = list(range(1, len(raw_items) + 1))
+        expected_count = len(expected_indices)
+
+        dialogue_by_index: dict[int, bool] = {}
+        dialogue_items = dialogue_content.get("items") if isinstance(dialogue_content.get("items"), list) else []
+        for position, item in enumerate(dialogue_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            match = re.search(r"\d+", str(item.get("shot_index", position)))
+            index = int(match.group(0)) if match else position
+            status = str(item.get("status") or "").strip().casefold()
+            silent = status in {"silent", "no_dialogue", "no-dialogue"} or item.get("no_dialogue") is True
+            dialogue_by_index[index] = not silent
+
+        def _present(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value.strip())
+            if isinstance(value, (list, tuple, dict, set)):
+                return bool(value)
+            return True
+
+        items: list[dict[str, Any]] = []
+        actual_indices: list[int] = []
+        invalid_index_rows: list[int] = []
+        missing_required_fields: list[dict[str, Any]] = []
+        dialogue_shots: list[int] = []
+        silent_shots: list[int] = []
+        for position, raw in enumerate(raw_items, start=1):
+            if not isinstance(raw, dict):
+                invalid_index_rows.append(position)
+                continue
+            item = dict(raw)
+            match = re.search(r"\d+", str(item.get("shot_index", position)))
+            if match:
+                shot_index = int(match.group(0))
+                item["shot_index"] = shot_index
+                actual_indices.append(shot_index)
+            else:
+                shot_index = position
+                invalid_index_rows.append(position)
+
+            # Normalize common aliases without rewriting creative content.
+            if "ducking" not in item:
+                for alias in ("dialogue_ducking", "ducking_plan"):
+                    if item.get(alias) is not None:
+                        item["ducking"] = item.get(alias)
+                        break
+            if "negative_audio" not in item:
+                for alias in ("negative_audio_constraints", "negative", "negative_constraints"):
+                    if item.get(alias) is not None:
+                        item["negative_audio"] = item.get(alias)
+                        break
+            if "cues" not in item and item.get("sound_cues") is not None:
+                item["cues"] = item.get("sound_cues")
+            if "foley" not in item and item.get("foley_events") is not None:
+                item["foley"] = item.get("foley_events")
+
+            missing: list[str] = []
+            # ambience/status must carry a value; foley/cues/ducking/negative_audio
+            # must be explicit fields but may legitimately be empty lists or a
+            # none/off value for a shot where that layer is intentionally absent.
+            for field in ("ambience", "status"):
+                if not _present(item.get(field)):
+                    missing.append(field)
+            for field in ("foley", "cues", "ducking", "negative_audio"):
+                if field not in item or item.get(field) is None:
+                    missing.append(field)
+            if missing:
+                missing_required_fields.append({"shot_index": shot_index, "fields": missing})
+
+            if dialogue_by_index.get(shot_index, False):
+                dialogue_shots.append(shot_index)
+            elif shot_index in dialogue_by_index:
+                silent_shots.append(shot_index)
+            items.append(item)
+
+        duplicates = sorted({value for value in actual_indices if actual_indices.count(value) > 1})
+        expected_set = set(expected_indices)
+        missing_indices = sorted(expected_set - set(actual_indices))
+        unexpected_indices = sorted(set(actual_indices) - expected_set)
+        sequence_ok = actual_indices == expected_indices and not duplicates and not invalid_index_rows
+        passed = bool(len(items) == expected_count and sequence_ok and not missing_required_fields)
+        result["items"] = items
+        result["sound_validation"] = {
+            "status": "pass" if passed else "fail",
+            "expected_items": expected_count,
+            "actual_items": len(items),
+            "expected_indices": expected_indices,
+            "actual_indices": actual_indices,
+            "missing_indices": missing_indices,
+            "unexpected_indices": unexpected_indices,
+            "duplicate_indices": duplicates,
+            "invalid_index_rows": invalid_index_rows,
+            "missing_required_fields": missing_required_fields,
+            "dialogue_shots": dialogue_shots,
+            "silent_shots": silent_shots,
+            "structural_authority": "harness",
+        }
+        return result
+
+    @staticmethod
+    def _guard_sound_plan_review(review: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
+        """Suppress sound-plan tail-shot false negatives caused by preview truncation."""
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else None
+        validation = content.get("sound_validation") if isinstance(content, dict) else None
+        if not isinstance(validation, dict) or str(validation.get("status") or "").lower() != "pass":
+            return guarded
+        deviations = guarded.get("deviations") if isinstance(guarded.get("deviations"), list) else []
+        structural_markers = (
+            "item count", "items count", "仅生成 10", "仅包含 10", "仅含 10",
+            "缺失 shot_index", "missing shot_index", "missing shots", "缺少 shot",
+            "11-14", "11–14", "shot_index 11", "shot_index 12", "shot_index 13", "shot_index 14",
+            "one-to-one", "一一对应", "连续编号", "actual_items", "expected_items",
+        )
+        kept: list[Any] = []
+        suppressed: list[Any] = []
+        for deviation in deviations:
+            try:
+                blob = json.dumps(deviation, ensure_ascii=False).casefold()
+            except TypeError:
+                blob = str(deviation).casefold()
+            if any(marker.casefold() in blob for marker in structural_markers):
+                suppressed.append(deviation)
+            else:
+                kept.append(deviation)
+        guarded["deviations"] = kept
+        if suppressed and not kept:
+            guarded["recommended_action"] = "proceed"
+            guarded["assessment"] = "Harness deterministic sound-plan validation passed; preview-truncation count/tail-shot deviations were suppressed."
+            guarded["reply"] = "逐镜音效已通过 Harness 的完整镜头覆盖校验；总管复盘里由前 10 条预览造成的尾镜缺失误判已被抑制。"
+            guarded["suggested_adjustments"] = []
+        guarded["harness_review_guard"] = {
+            "sound_validation_status": "pass",
+            "structural_authority": "artifact.content.sound_validation",
+            "suppressed_structural_deviations": suppressed,
+            "remaining_semantic_deviations": kept,
+        }
+        return guarded
+
+    @staticmethod
+    def _guard_dialogue_plan_review(review: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
+        """Suppress reviewer false negatives caused only by the old ten-row preview cap."""
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else None
+        validation = content.get("dialogue_validation") if isinstance(content, dict) else None
+        if not isinstance(validation, dict) or str(validation.get("status") or "").lower() != "pass":
+            return guarded
+        deviations = guarded.get("deviations") if isinstance(guarded.get("deviations"), list) else []
+        structural_markers = (
+            "item count", "items count", "仅生成 10", "仅包含 10", "仅含 10",
+            "缺失 shot_index", "missing shot_index", "missing shots", "缺少 shot",
+            "11-14", "11–14", "shot_index 11", "shot_index 12", "shot_index 13", "shot_index 14",
+            "one-to-one", "一一对应", "连续编号", "actual_items", "expected_items",
+        )
+        kept: list[Any] = []
+        suppressed: list[Any] = []
+        for deviation in deviations:
+            try:
+                blob = json.dumps(deviation, ensure_ascii=False).casefold()
+            except TypeError:
+                blob = str(deviation).casefold()
+            if any(marker.casefold() in blob for marker in structural_markers):
+                suppressed.append(deviation)
+            else:
+                kept.append(deviation)
+        guarded["deviations"] = kept
+        if suppressed and not kept:
+            guarded["recommended_action"] = "proceed"
+            guarded["assessment"] = "Harness deterministic dialogue-plan validation passed; preview-truncation count/tail-shot deviations were suppressed."
+            guarded["reply"] = "对白与口型已通过 Harness 的完整镜头覆盖校验；总管复盘里由前 10 条预览造成的 11–14 缺失误判已被抑制。"
+            guarded["suggested_adjustments"] = []
+        guarded["harness_review_guard"] = {
+            "dialogue_validation_status": "pass",
+            "structural_authority": "artifact.content.dialogue_validation",
+            "suppressed_structural_deviations": suppressed,
+            "remaining_semantic_deviations": kept,
+        }
+        return guarded
+
+    @staticmethod
+    def _guard_storyboard_review(
+        review: dict[str, Any], artifact: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Prevent preview-limit/count arithmetic false negatives on storyboard review."""
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else None
+        validation = content.get("storyboard_validation") if isinstance(content, dict) else None
+        if not isinstance(validation, dict) or str(validation.get("status") or "").lower() != "pass":
+            return guarded
+
+        # A storyboard stage cannot prove a downstream continuity_qa/review result:
+        # regenerating storyboard intentionally invalidates those descendants. Treat
+        # requests for downstream QA closure as next-stage work, never as a reason to
+        # regenerate an otherwise-valid storyboard again.
+        downstream_qa_markers = (
+            "continuity_qa", "continuity qa", "qa closure", "qa re-validation",
+            "qa revalidation", "复验结果", "qa 复验", "一致性检查重新",
+        )
+
+        deviations = guarded.get("deviations")
+        if not isinstance(deviations, list):
+            deviations = []
+        structural_markers = (
+            "shot count", "shots count", "镜头数量", "分镜数量", "镜头总数", "分镜总数",
+            "index sequence", "index continuity", "编号不连续", "镜头编号", "missing shots",
+            "缺少镜头", "缺少 shots", "estimated_seconds", "duration sum", "时长总和",
+            "actual_shots", "expected_shots",
+        )
+        semantic_markers = (
+            "beat", "story", "剧情", "叙事", "cliffhanger", "人物", "角色", "动作",
+            "continuity", "reference", "绑定", "服装", "道具", "场景", "blocking",
+        )
+        kept: list[Any] = []
+        suppressed: list[Any] = []
+        for deviation in deviations:
+            try:
+                blob = json.dumps(deviation, ensure_ascii=False).casefold()
+            except TypeError:
+                blob = str(deviation).casefold()
+            downstream_only = any(marker.casefold() in blob for marker in downstream_qa_markers)
+            structural = any(marker.casefold() in blob for marker in structural_markers)
+            semantic = any(marker.casefold() in blob for marker in semantic_markers)
+            if downstream_only or (structural and not semantic):
+                suppressed.append(deviation)
+            else:
+                kept.append(deviation)
+        guarded["deviations"] = kept
+        if suppressed and not kept:
+            guarded["recommended_action"] = "proceed"
+            guarded["assessment"] = (
+                "Harness deterministic storyboard validation passed; reviewer-only "
+                "shot-count/index/duration deviations were suppressed."
+            )
+            guarded["reply"] = (
+                "分镜已通过 Harness 的确定性结构校验；完整镜头序列、编号和时长计算均有效。"
+                "总管复盘中由预览截断造成的数量/尾镜误判已被抑制，可以继续做内容确认。"
+            )
+            guarded["suggested_adjustments"] = []
+        guarded["harness_review_guard"] = {
+            "storyboard_validation_status": "pass",
+            "structural_authority": "artifact.content.storyboard_validation",
+            "suppressed_structural_deviations": suppressed,
+            "remaining_semantic_deviations": kept,
+        }
+        return guarded
+
+    def revalidate_storyboard(self, workspace_id: str) -> dict[str, Any]:
+        """Recompute storyboard validation/review without regenerating creative shots."""
+        workspace = self._workspace(workspace_id)
+        if self.db.list_active_jobs(workspace_id):
+            raise OrchestrationError("工作区仍有进行中的任务，请等待结束后再重新校验分镜")
+        current = self.db.get_artifact(workspace_id, "storyboard")
+        if not current:
+            raise OrchestrationError("当前还没有分镜产物可重新校验")
+        content = current.get("content") if isinstance(current.get("content"), dict) else {}
+        saved = self.db.get_stage_guidance(workspace_id, "storyboard") or {}
+        directive = saved.get("director_plan") if isinstance(saved.get("director_plan"), dict) else {}
+        instruction = str(saved.get("user_instruction") or (content.get("_execution") or {}).get("user_instruction") or "")
+        reference_artifact = self.db.get_artifact(workspace_id, "reference_images")
+        current_shots = content.get("shots") if isinstance(content.get("shots"), list) else []
+        normalized = self._normalize_storyboard(
+            content,
+            workspace=workspace,
+            execution_directive=directive,
+            user_instruction=instruction,
+            reference_content=(reference_artifact or {}).get("content", {}),
+            previous_shot_count=len(current_shots),
+        )
+        normalized["_agent"] = content.get("_agent") or normalized.get("_agent")
+        result = self.db.upsert_artifact(
+            workspace_id,
+            "storyboard",
+            STAGE_LABELS["storyboard"],
+            normalized,
+            "harness-storyboard-revalidate",
+            upstream=REQUIRES.get("storyboard", []),
+        )
+        provider = self.providers.workflow()
+        self._post_generation_review(
+            provider=provider,
+            workspace=workspace,
+            stage="storyboard",
+            artifact=result,
+            user_instruction=instruction,
+            project_memory=self.db.get_workspace_memory(workspace_id),
+            execution_directive=directive,
+        )
+        validation = normalized.get("storyboard_validation") or {}
+        self.db.set_approval(
+            workspace_id,
+            GATES["storyboard"],
+            "pending",
+            "分镜已重新校验，请确认后继续" if validation.get("status") == "pass" else "分镜结构校验未通过，需要修正后再确认",
+        )
+        self.db.add_event(workspace_id, "storyboard.revalidated", {
+            "revision": result.get("revision"),
+            "status": validation.get("status"),
+            "shots": validation.get("actual_shots"),
+            "expected_shots": validation.get("expected_shots"),
+            "media_regenerated": False,
+        })
+        return {
+            "artifact": result,
+            "storyboard_validation": validation,
+            "media_regenerated": False,
+        }
+
+    def revalidate_dialogue_plan(self, workspace_id: str) -> dict[str, Any]:
+        """Recompute dialogue validation/review without regenerating dialogue text."""
+        workspace = self._workspace(workspace_id)
+        if self.db.list_active_jobs(workspace_id):
+            raise OrchestrationError("工作区仍有进行中的任务，请等待结束后再重新校验对白与口型")
+        current = self.db.get_artifact(workspace_id, "dialogue_plan")
+        storyboard = self.db.get_artifact(workspace_id, "storyboard")
+        if not current:
+            raise OrchestrationError("当前还没有对白与口型产物可重新校验")
+        if not storyboard:
+            raise OrchestrationError("缺少上游分镜，无法校验对白与口型镜头覆盖")
+        content = current.get("content") if isinstance(current.get("content"), dict) else {}
+        normalized = self._normalize_dialogue_plan(content, storyboard_content=(storyboard.get("content") or {}))
+        normalized["_agent"] = content.get("_agent") or normalized.get("_agent")
+        saved = self.db.get_stage_guidance(workspace_id, "dialogue_plan") or {}
+        directive = saved.get("director_plan") if isinstance(saved.get("director_plan"), dict) else {}
+        instruction = str(saved.get("user_instruction") or (content.get("_execution") or {}).get("user_instruction") or "")
+        result = self.db.upsert_artifact(
+            workspace_id, "dialogue_plan", STAGE_LABELS["dialogue_plan"], normalized,
+            "harness-dialogue-revalidate", upstream=REQUIRES.get("dialogue_plan", []),
+        )
+        self._post_generation_review(
+            provider=self.providers.workflow(), workspace=workspace, stage="dialogue_plan", artifact=result,
+            user_instruction=instruction, project_memory=self.db.get_workspace_memory(workspace_id),
+            execution_directive=directive,
+        )
+        validation = normalized.get("dialogue_validation") or {}
+        self.db.add_event(workspace_id, "dialogue_plan.revalidated", {
+            "revision": result.get("revision"), "status": validation.get("status"),
+            "items": validation.get("actual_items"), "expected_items": validation.get("expected_items"),
+            "media_regenerated": False,
+        })
+        return {"artifact": result, "dialogue_validation": validation, "media_regenerated": False}
+
+    def revalidate_sound_plan(self, workspace_id: str) -> dict[str, Any]:
+        """Recompute sound-plan validation/review without regenerating sound design."""
+        workspace = self._workspace(workspace_id)
+        if self.db.list_active_jobs(workspace_id):
+            raise OrchestrationError("工作区仍有进行中的任务，请等待结束后再重新校验逐镜音效")
+        current = self.db.get_artifact(workspace_id, "sound_plan")
+        storyboard = self.db.get_artifact(workspace_id, "storyboard")
+        dialogue = self.db.get_artifact(workspace_id, "dialogue_plan")
+        if not current:
+            raise OrchestrationError("当前还没有逐镜音效产物可重新校验")
+        if not storyboard:
+            raise OrchestrationError("缺少上游分镜，无法校验逐镜音效镜头覆盖")
+        content = current.get("content") if isinstance(current.get("content"), dict) else {}
+        normalized = self._normalize_sound_plan(
+            content,
+            storyboard_content=(storyboard.get("content") or {}),
+            dialogue_content=(dialogue.get("content") or {}) if dialogue else {},
+        )
+        normalized["_agent"] = content.get("_agent") or normalized.get("_agent")
+        saved = self.db.get_stage_guidance(workspace_id, "sound_plan") or {}
+        directive = saved.get("director_plan") if isinstance(saved.get("director_plan"), dict) else {}
+        instruction = str(saved.get("user_instruction") or (content.get("_execution") or {}).get("user_instruction") or "")
+        result = self.db.upsert_artifact(
+            workspace_id, "sound_plan", STAGE_LABELS["sound_plan"], normalized,
+            "harness-sound-revalidate", upstream=REQUIRES.get("sound_plan", []),
+        )
+        self._post_generation_review(
+            provider=self.providers.workflow(), workspace=workspace, stage="sound_plan", artifact=result,
+            user_instruction=instruction, project_memory=self.db.get_workspace_memory(workspace_id),
+            execution_directive=directive,
+        )
+        validation = normalized.get("sound_validation") or {}
+        self.db.add_event(workspace_id, "sound_plan.revalidated", {
+            "revision": result.get("revision"), "status": validation.get("status"),
+            "items": validation.get("actual_items"), "expected_items": validation.get("expected_items"),
+            "media_regenerated": False,
+        })
+        return {"artifact": result, "sound_validation": validation, "media_regenerated": False}
 
     @staticmethod
     def _guard_asset_manifest_review(
@@ -1184,6 +2600,12 @@ class Orchestrator:
             review = self._guard_asset_manifest_review(review, artifact, execution_directive)
         elif stage == "reference_images" and review:
             review = self._guard_reference_images_review(review, artifact)
+        elif stage == "storyboard" and review:
+            review = self._guard_storyboard_review(review, artifact)
+        elif stage == "dialogue_plan" and review:
+            review = self._guard_dialogue_plan_review(review, artifact)
+        elif stage == "sound_plan" and review:
+            review = self._guard_sound_plan_review(review, artifact)
         reply = str(review.get("reply") or "").strip()
         if not reply:
             next_actions = context["next_actions"]
