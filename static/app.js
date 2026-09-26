@@ -34,7 +34,12 @@ async function api(path, options = {}) {
     headers,
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || body.message || `HTTP ${response.status}`);
+  if (!response.ok) {
+    const detail = body.detail || body.message;
+    const error = new Error(typeof detail === "object" ? (detail.message || `HTTP ${response.status}`) : (detail || `HTTP ${response.status}`));
+    error.code = typeof detail === "object" ? detail.code : "";
+    throw error;
+  }
   return body;
 }
 
@@ -984,9 +989,12 @@ function renderAssetCandidate(candidate, baseCandidateId) {
   const isSelected = Boolean(candidate.selected);
   const isBase = candidate.id === baseCandidateId;
   const feedback = String(candidate.feedback || "").trim();
+  const provenance = candidate.provenance || {};
+  const originLabel = provenance.generation_mode === "text_to_image" ? "文生图原始产物" : provenance.generation_mode === "image_to_image" ? "图生图 · 人像受信待核验" : "来源未核验";
+  const archiveLabel = provenance.archive_status === "archived" ? "TOS 原始文件已归档" : "TOS 未归档";
   return `<div class="visual-candidate ${isSelected ? "selected" : ""} ${isBase ? "edit-base" : ""}" data-candidate-card="${escapeHtml(candidate.id)}">
     <a class="visual-candidate-image" href="${escapeHtml(candidate.url || "#")}" target="_blank" rel="noopener">${renderMedia(candidate.url)}</a>
-    <div class="visual-candidate-meta"><span>${escapeHtml(candidate.model || "Seedream")}</span>${isSelected ? `<span class="pill ready">当前采用</span>` : ""}${isBase ? `<span class="pill">调整基准</span>` : ""}</div>
+    <div class="visual-candidate-meta"><span>${escapeHtml(candidate.model || "Seedream")}</span><span class="pill">${escapeHtml(originLabel)}</span><span class="pill">${escapeHtml(archiveLabel)}</span>${isSelected ? `<span class="pill ready">当前采用</span>` : ""}${isBase ? `<span class="pill">调整基准</span>` : ""}</div>
     ${feedback ? `<div class="artifact-meta candidate-feedback-note">本次要求：${escapeHtml(feedback)}</div>` : ""}
     <div class="visual-candidate-actions">
       ${isSelected
@@ -1044,7 +1052,7 @@ function renderSingleAssetDetail(item, kind, idx = 0) {
         <div class="candidate-editor">
           <textarea rows="3" data-candidate-feedback placeholder="只改这个${escapeHtml(label)}。例如：${kind === "characters" ? "脸更接近原片、年龄感更明显；保留身份与识别色，只调整服装和气质" : kind === "scenes" ? "保持同一栋法国住宅 DNA；只调整这个空间的材质、光线或构图" : kind === "reference_images" ? "保持所有已绑定 canonical asset 的身份、脸、服装、场景结构和道具形态，只调整构图、相对位置、镜头感或光线" : "保持道具身份和关键结构；只调整材质、旧化程度或尺度"}"></textarea>
           ${candidateStatusHtml(kind, canonicalKey)}
-          <div class="candidate-editor-actions"><span class="artifact-meta">${baseCandidateId ? "默认基于当前采用/最近候选继续调整；锁定只决定下游采用，不会阻止抽新候选" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button></div>
+          <div class="candidate-editor-actions"><span class="artifact-meta">${kind === "characters" || (kind === "reference_images" && canonicalKey.includes("char_")) ? "人物参考默认按文字生成原始候选；采用后仍需视频预检" : baseCandidateId ? "默认基于当前采用/最近候选继续调整；锁定只决定下游采用，不会阻止抽新候选" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button>${baseCandidateId ? `<button class="mini-button" data-generate-fresh>按文字重画</button>` : ""}</div>
         </div>
       </div>
     </div>
@@ -1287,7 +1295,7 @@ function renderAssetDesignWorkbench(content, kind) {
       <div class="candidate-gallery">${candidateHtml}</div>
       <div class="candidate-editor">
         <textarea rows="2" data-candidate-feedback placeholder="只改这个${escapeHtml(label)}。例如：${kind === "characters" ? "脸更接近原片、年龄感更明显；保留人物身份和酒红色识别色，但服装改成可信的法国乡村绗缝外套，不要中国式大红花棉袄" : kind === "scenes" ? "门厅更窄、吊灯更大、保留现有布局和法式豪宅质感" : "旅行袋更旧、更大；保持绿灰帆布和束带结构不变"}"></textarea>
-        <div class="candidate-editor-actions"><span class="artifact-meta">${baseCandidateId ? "默认基于当前采用/最近候选做图生图调整" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button></div>
+        <div class="candidate-editor-actions"><span class="artifact-meta">${kind === "characters" || (kind === "reference_images" && canonicalKey.includes("char_")) ? "人物参考默认按文字生成原始候选；采用后仍需视频预检" : baseCandidateId ? "默认基于当前采用/最近候选做图生图调整" : "当前为文生图首抽"}</span><button class="mini-button" data-generate-candidate="1">抽 1 张</button><button class="mini-button" data-generate-candidate="4">抽 4 张</button>${baseCandidateId ? `<button class="mini-button" data-generate-fresh>按文字重画</button>` : ""}</div>
       </div>
     </section>`;
   }).join("");
@@ -1305,7 +1313,7 @@ function renderAssetDesignWorkbench(content, kind) {
   </div>`;
 }
 
-async function generateCandidateForCard(card, count = 1) {
+async function generateCandidateForCard(card, count = 1, useBaseReference = true) {
   const stage = card.dataset.assetStage;
   const canonicalKey = card.dataset.canonicalKey;
   const feedback = card.querySelector("[data-candidate-feedback]")?.value?.trim() || "";
@@ -1314,15 +1322,28 @@ async function generateCandidateForCard(card, count = 1) {
   const selected = candidates.find(c => c.selected);
   const latest = candidates[candidates.length - 1];
   const baseCandidateId = state.candidateBases[key] || selected?.id || latest?.id || "";
-  const buttons = card.querySelectorAll("[data-generate-candidate]");
+  const buttons = card.querySelectorAll("[data-generate-candidate], [data-generate-fresh]");
   buttons.forEach(btn => btn.disabled = true);
   setCandidateRequestStatus(card, "loading", `正在生成 ${count} 张候选，请稍候…`);
   try {
     toast(`${assetStageLabel(stage)} ${canonicalKey} 正在抽 ${count} 张…`);
-    const result = await api(`/api/workspaces/${state.selectedId}/asset-candidates`, {
-      method: "POST",
-      body: JSON.stringify({stage, canonical_key: canonicalKey, feedback, base_candidate_id: baseCandidateId, count}),
-    });
+    let result;
+    try {
+      result = await api(`/api/workspaces/${state.selectedId}/asset-candidates`, {
+        method: "POST",
+        body: JSON.stringify({stage, canonical_key: canonicalKey, feedback, base_candidate_id: baseCandidateId, use_base_reference: useBaseReference, count}),
+      });
+    } catch (error) {
+      if (useBaseReference && error.code === "reference_unavailable") {
+        if (window.confirm("旧参考图文件已丢失，临时链接也已过期。是否按当前文字设计重新生成？新图可能与旧图外观不同，生成会使用相应额度。")) {
+          return await generateCandidateForCard(card, count, false);
+        }
+        state.candidateRequestStatus[key] = {type:"warning", text:"已取消生成；恢复旧图后可继续基于旧图调整。"};
+        setCandidateRequestStatus(card, "warning", "已取消生成；恢复旧图后可继续基于旧图调整。");
+        return null;
+      }
+      throw error;
+    }
     const created = result.items || [];
     if (created.length) state.candidateBases[key] = created[created.length - 1].id;
     const partial = result.status === "partial" || created.length < Number(result.requested_count || count);
@@ -1387,7 +1408,15 @@ function bindAssetCandidateUi() {
   document.querySelectorAll("[data-generate-candidate]").forEach(button => button.addEventListener("click", async () => {
     const card = button.closest("[data-asset-stage]");
     if (!card) return;
-    try { await generateCandidateForCard(card, Number(button.dataset.generateCandidate || 1)); }
+    const personReference = card.dataset.assetStage === "characters" || (card.dataset.assetStage === "reference_images" && (card.dataset.canonicalKey || "").includes("char_"));
+    try { await generateCandidateForCard(card, Number(button.dataset.generateCandidate || 1), !personReference); }
+    catch (error) { toast(error.message); }
+  }));
+  document.querySelectorAll("[data-generate-fresh]").forEach(button => button.addEventListener("click", async () => {
+    const card = button.closest("[data-asset-stage]");
+    if (!card) return;
+    if (!window.confirm("原图缺失时可按文字设计重新生成 1 张，但无法保留旧图的精确外观。继续吗？")) return;
+    try { await generateCandidateForCard(card, 1, false); }
     catch (error) { toast(error.message); }
   }));
   document.querySelectorAll("[data-base-candidate]").forEach(button => button.addEventListener("click", () => {

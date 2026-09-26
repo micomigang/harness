@@ -16,8 +16,8 @@ def test_upload_uses_native_label_file_picker():
 
 def test_frontend_assets_are_versioned_to_avoid_mixed_cache():
     html = (_root() / "static" / "index.html").read_text(encoding="utf-8")
-    assert '/static/app.js?v=20260924-v12-visual-workbench-long-canvas' in html
-    assert '/static/style.css?v=20260924-v12-visual-workbench-long-canvas' in html
+    assert '/static/app.js?v=20260927-v13-image-provenance' in html
+    assert '/static/style.css?v=20260927-v13-image-provenance' in html
 
 
 def test_workspace_bootstrap_is_not_blocked_by_health_or_meta_failure():
@@ -66,7 +66,7 @@ def test_advancing_explicitly_rebinds_director_chat_to_next_stage():
     js = (_root() / "static" / "app.js").read_text(encoding="utf-8")
     assert "async function chatStageGuidance(messageOverride = null, stageOverride = null)" in js
     assert "const stage = stageOverride || currentGuidanceStage();" in js
-    assert "const result = await chatStageGuidance(message, stage);" in js
+    assert "const result = await chatStageGuidance(typed, stage);" in js
     assert 'state.chatStageOverride = action.stage || "";' in js
 
 

@@ -369,6 +369,54 @@ def test_sound_review_guard_suppresses_ten_item_preview_false_negative():
     assert guarded["harness_review_guard"]["suppressed_structural_deviations"]
 
 
+def test_preview_contract_fails_before_saving_when_tracking_field_is_missing():
+    content = {
+        "shot_index": 1,
+        "provider_job_id": "cgt-123",
+        "model": "doubao-seedance-2-5-260628",
+        "url": "/media/shot-001.mp4",
+        "status": "succeeded",
+    }
+    Orchestrator._validate_preview_contract(content)
+    del content["model"]
+    try:
+        Orchestrator._validate_preview_contract(content)
+    except OrchestrationError as exc:
+        assert "model" in str(exc)
+    else:
+        raise AssertionError("missing preview model must stop execution")
+
+
+def test_preview_contract_rejects_wrong_requested_shot():
+    content = {
+        "shot_index": 1, "provider_job_id": "cgt-123", "model": "seedance-mini",
+        "url": "/media/shot-001.mp4", "status": "succeeded",
+    }
+    try:
+        Orchestrator._validate_preview_contract(content, expected_shot_index=3)
+    except OrchestrationError as exc:
+        assert "要求 shot_index=3" in str(exc)
+    else:
+        raise AssertionError("wrong preview shot must not be persisted")
+
+
+def test_preview_review_guard_removes_false_metadata_blocker():
+    artifact = {"content": {
+        "shot_index": 1, "provider_job_id": "cgt-123", "model": "seedance",
+        "url": "/media/shot-001.mp4", "status": "succeeded",
+    }}
+    review = {
+        "deviations": ["Artifact content missing shot_index, provider_job_id, and model"],
+        "suggested_adjustments": ["Enrich preview metadata", "Review visual continuity"],
+        "recommended_action": "wait_for_user",
+    }
+    guarded = Orchestrator._guard_preview_review(review, artifact)
+    assert guarded["deviations"] == []
+    assert guarded["suggested_adjustments"] == ["Review visual continuity"]
+    assert guarded["recommended_action"] == "wait_for_user"
+    assert guarded["harness_review_guard"]["preview_contract_status"] == "pass"
+
+
 def test_storyboard_expected_count_recognizes_compact_chinese_jing_and_beats_workspace_default():
     expected = Orchestrator._storyboard_expected_count(
         {"settings": {"storyboard_count": 8}},

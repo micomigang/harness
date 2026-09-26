@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import mimetypes
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from .base import WorkflowProvider
+from app.image_provenance import (
+    IMAGE_FORMATS, ark_account_from_url, contains_person, image_format,
+    signed_url_expiry,
+)
+from app.tos_archive import TosArchive
 from app.guidance import sanitize_parameter_overrides
 from app.reference_plan import (
     canonical_combination_key,
@@ -43,6 +51,8 @@ class SeedreamProvider(WorkflowProvider):
         max_assets: int = 6,
         output_dir: Path,
         client: httpx.Client | None = None,
+        account_id: str = "",
+        original_archive: TosArchive | None = None,
     ):
         if not api_key or not model:
             raise ValueError("IMAGE_API_KEY and IMAGE_MODEL are required")
@@ -54,6 +64,8 @@ class SeedreamProvider(WorkflowProvider):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._client = client
+        self.account_id = account_id.strip()
+        self.original_archive = original_archive
 
     def generate(self, stage: str, context: dict[str, Any]) -> dict[str, Any]:
         if stage != "reference_images":
@@ -93,6 +105,10 @@ class SeedreamProvider(WorkflowProvider):
             anchored_sources.append((stage_name, enriched))
         if not anchored_sources:
             raise SeedreamError("No character, scene or prop assets available")
+        source_specs = {
+            str(item.get("canonical_key") or item.get("id") or ""): item
+            for _, item in anchored_sources
+        }
 
         # Combination intent must come from the user-bound stage instruction, not
         # from the director's paraphrase.  The previous implementation scanned the
@@ -180,6 +196,7 @@ class SeedreamProvider(WorkflowProvider):
                         "remote_url": selected.get("remote_url") or "",
                         "url": selected.get("url") or "",
                         "local_path": selected.get("local_path") or "",
+                        "provenance": selected.get("provenance") or {},
                         "status": "selected_candidate",
                         "origin": "upstream_selected_candidate",
                         "candidate_id": selected.get("id"),
@@ -204,6 +221,7 @@ class SeedreamProvider(WorkflowProvider):
                         "remote_url": (ref or {}).get("remote_url") or "",
                         "url": library_asset.get("preview_url") or (ref or {}).get("url") or "",
                         "local_path": (ref or {}).get("local_path") or "",
+                        "provenance": (ref or {}).get("provenance") or {},
                         "status": "reused",
                         "prompt": str(item.get("generation_prompt_en") or ""),
                     }
@@ -232,26 +250,34 @@ class SeedreamProvider(WorkflowProvider):
             missing_combinations: list[dict[str, Any]] = []
             generated_combinations = 0
             for combo_index, source_ids in enumerate(combinations, start=1):
+                human_combination = any(key.startswith("char_") for key in source_ids)
                 missing = [key for key in source_ids if key not in isolated_by_key]
                 if missing:
                     missing_combinations.append({"source_ids": source_ids, "missing_inputs": missing, "reason": "missing isolated reference"})
                     continue
 
                 reference_values: list[str] = []
+                unavailable_references: list[str] = []
                 input_candidate_ids: list[str] = []
                 for key in source_ids:
                     ref_item = isolated_by_key[key]
-                    value = self._reference_image_value(
-                        str(ref_item.get("remote_url") or ref_item.get("url") or ""),
-                        str(ref_item.get("local_path") or ""),
-                    )
-                    if value:
-                        reference_values.append(value)
+                    if not human_combination:
+                        value = self._reference_image_value(
+                            str(ref_item.get("remote_url") or ref_item.get("url") or ""),
+                            str(ref_item.get("local_path") or ""),
+                        )
+                        if value:
+                            reference_values.append(value)
+                        else:
+                            unavailable_references.append(key)
                     if ref_item.get("candidate_id"):
                         input_candidate_ids.append(str(ref_item.get("candidate_id")))
 
                 reference_key = canonical_combination_key(source_ids)
-                prompt = self._combination_prompt(source_ids, prompt_addendum)
+                prompt = (
+                    self._person_combination_text_prompt(source_ids, source_specs, prompt_addendum)
+                    if human_combination else self._combination_prompt(source_ids, prompt_addendum)
+                )
 
                 # Reconcile/fill semantics: exact existing relationship media wins.
                 # Reuse its URL and only refresh the upstream candidate bindings.
@@ -271,6 +297,7 @@ class SeedreamProvider(WorkflowProvider):
                         "remote_url": existing_combo.get("remote_url") or "",
                         "url": existing_combo.get("url") or "",
                         "local_path": existing_combo.get("local_path") or "",
+                        "provenance": existing_combo.get("provenance") or {},
                         "status": "selected_candidate" if was_selected else "candidate",
                         "origin": "existing_reference_reuse",
                         "input_candidate_ids": input_candidate_ids,
@@ -282,8 +309,8 @@ class SeedreamProvider(WorkflowProvider):
                 if used_generation_budget >= generation_budget:
                     missing_combinations.append({"source_ids": source_ids, "missing_inputs": [], "reason": "generation budget reached"})
                     continue
-                if len(reference_values) < 2:
-                    missing_combinations.append({"source_ids": source_ids, "missing_inputs": [], "reason": "fewer than two usable reference images"})
+                if unavailable_references:
+                    missing_combinations.append({"source_ids": source_ids, "missing_inputs": unavailable_references, "reason": "reference image file missing or temporary URL expired"})
                     continue
 
                 combo = self._request_and_download(
@@ -412,6 +439,28 @@ class SeedreamProvider(WorkflowProvider):
             prompt += " Art director requirements: " + prompt_addendum
         return prompt
 
+    @staticmethod
+    def _person_combination_text_prompt(
+        source_ids: list[str], source_specs: dict[str, dict[str, Any]], prompt_addendum: str = ""
+    ) -> str:
+        descriptions: list[str] = []
+        for key in source_ids:
+            spec = source_specs.get(key) or {}
+            description = str(spec.get("generation_prompt_en") or spec.get("description") or spec.get("appearance") or key)
+            if key.startswith("scene_"):
+                for exclusion in (", empty environment", ", no people", ", no human figures", ", no characters"):
+                    description = description.replace(exclusion, "")
+            descriptions.append(f"{key}: {description}")
+        prompt = (
+            "Create one photorealistic original image from text only for a contemporary French drama. "
+            "Depict these canonical people and setting together with natural scale and lighting. "
+            "Keep wardrobe, architecture and props consistent with the specifications. "
+            "No text, captions or watermark. Specifications: " + " | ".join(descriptions)
+        )
+        if prompt_addendum:
+            prompt += " Art director requirements: " + prompt_addendum
+        return prompt
+
     def generate_candidate(
         self,
         *,
@@ -535,6 +584,10 @@ class SeedreamProvider(WorkflowProvider):
             reference = self._reference_image_value(reference_url, reference_local_path)
             if reference:
                 references = [reference]
+            elif reference_url or reference_local_path:
+                raise SeedreamError(
+                    "参考图本地文件缺失，远端临时链接已失效。请恢复原图，或选择“按文字重画”生成新的候选图。"
+                )
         if references:
             payload["image"] = references[0] if len(references) == 1 else references[:10]
         response = client.post(
@@ -549,7 +602,8 @@ class SeedreamProvider(WorkflowProvider):
             raise SeedreamError(
                 f"Seedream generation failed ({response.status_code}): {response.text[:800]}"
             )
-        data = response.json().get("data") or []
+        response_body = response.json()
+        data = response_body.get("data") or []
         remote_url = str(data[0].get("url", "")) if data else ""
         if not remote_url:
             raise SeedreamError("Seedream response did not contain an image URL")
@@ -558,15 +612,60 @@ class SeedreamProvider(WorkflowProvider):
         safe_id = re.sub(r"[^A-Za-z0-9_-]+", "-", source_id).strip("-") or "asset"
         target_dir = self.output_dir / workspace_id / output_subdir
         target_dir.mkdir(parents=True, exist_ok=True)
-        filename = (
-            f"{source_kind}-{safe_id}-{uuid.uuid4().hex[:10]}.png"
-            if output_subdir == "asset_candidates"
-            else f"{source_kind}-{safe_id}.png"
-        )
-        target = target_dir / filename
         download = client.get(remote_url)
         download.raise_for_status()
-        target.write_bytes(download.content)
+        raw = download.content
+        detected = image_format(raw)
+        fallback = Path(urlparse(remote_url).path).suffix.lower().lstrip(".")
+        if fallback == "jpg":
+            fallback = "jpeg"
+        media_format = detected or (fallback if fallback in IMAGE_FORMATS else "png")
+        extension, mime_type = IMAGE_FORMATS[media_format]
+        filename = (
+            f"{source_kind}-{safe_id}-{uuid.uuid4().hex[:10]}{extension}"
+            if output_subdir == "asset_candidates"
+            else f"{source_kind}-{safe_id}{extension}"
+        )
+        target = target_dir / filename
+        target.write_bytes(raw)
+        digest = hashlib.sha256(raw).hexdigest()
+        url_account = ark_account_from_url(remote_url)
+        if self.account_id and url_account and self.account_id != url_account:
+            target.unlink(missing_ok=True)
+            raise SeedreamError("Seedream output account does not match ARK_ACCOUNT_ID")
+        created = response_body.get("created")
+        try:
+            generated_at = datetime.fromtimestamp(int(created), tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError, OSError):
+            generated_at = datetime.now(timezone.utc)
+        expiry = signed_url_expiry(remote_url)
+        provenance = {
+            "provider": "volcengine-ark",
+            "model": self.model,
+            "generation_mode": "image_to_image" if references else "text_to_image",
+            "account_id": url_account or self.account_id,
+            "generated_at": generated_at.isoformat(),
+            "original_url": remote_url,
+            "original_url_expires_at": expiry.isoformat() if expiry else "",
+            "media_format": media_format,
+            "mime_type": mime_type,
+            "format_verified": bool(detected),
+            "sha256": digest,
+            "byte_size": len(raw),
+            "original_bytes": True,
+            "contains_person": contains_person({"canonical_key": item.get("canonical_key") or source_id, "source_kind": source_kind}),
+            "tos_uri": "",
+            "archive_status": "not_configured",
+        }
+        if self.original_archive and self.original_archive.enabled:
+            try:
+                provenance["tos_uri"] = self.original_archive.upload_original(
+                    target, workspace_id, digest
+                )
+                provenance["archive_status"] = "archived"
+            except Exception as exc:
+                provenance["archive_status"] = "failed"
+                provenance["archive_error"] = str(exc)[:300]
         relative = target.relative_to(self.output_dir).as_posix()
         return {
             "source_kind": source_kind,
@@ -581,6 +680,7 @@ class SeedreamProvider(WorkflowProvider):
             "local_path": str(target),
             "status": "succeeded",
             "prompt": prompt,
+            "provenance": provenance,
         }
 
     @staticmethod
@@ -592,6 +692,18 @@ class SeedreamProvider(WorkflowProvider):
             return f"data:{mime};base64,{encoded}"
         url = str(reference_url or "").strip()
         if url.startswith("https://") or url.startswith("http://"):
+            params = parse_qs(urlparse(url).query)
+            signed_at = params.get("X-Tos-Date", [""])[0]
+            expires = params.get("X-Tos-Expires", [""])[0]
+            if signed_at and expires:
+                try:
+                    deadline = datetime.strptime(signed_at, "%Y%m%dT%H%M%SZ").replace(
+                        tzinfo=timezone.utc
+                    ) + timedelta(seconds=int(expires))
+                    if datetime.now(timezone.utc) >= deadline:
+                        return ""
+                except (ValueError, OverflowError):
+                    return ""
             return url
         return ""
 

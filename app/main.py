@@ -19,6 +19,8 @@ from .agents import AGENT_SPECS, STAGE_AGENTS, STAGE_GUIDANCE_HINTS
 from .config import settings
 from .db import Database, utcnow
 from .orchestrator import GATES, STAGE_LABELS, STAGES, OrchestrationError, Orchestrator
+from .image_provenance import contains_person
+from .providers.seedream import SeedreamProvider
 
 
 app = FastAPI(title="爆款复制 Harness", version="0.4.0")
@@ -110,6 +112,7 @@ class AssetCandidateGenerateRequest(BaseModel):
     canonical_key: str = Field(min_length=1, max_length=240)
     feedback: str = Field(default="", max_length=4000)
     base_candidate_id: str = Field(default="", max_length=128)
+    use_base_reference: bool = True
     count: int = Field(default=1, ge=1, le=4)
 
 
@@ -645,6 +648,24 @@ def _generate_asset_candidate_images(
     if not callable(generate_method):
         raise HTTPException(409, "当前 Provider 未配置可交互的 Seedream 图片生成能力")
 
+    generation_item = item
+    if stage == "reference_images" and base is None and contains_person(item):
+        source_ids = item.get("source_ids") or item.get("source_id") or []
+        if isinstance(source_ids, str):
+            source_ids = [source_ids]
+        source_specs: dict[str, dict[str, Any]] = {}
+        for source_stage in ("characters", "scenes", "props"):
+            source_artifact = db.get_artifact(workspace_id, source_stage) or {}
+            for source in (source_artifact.get("content") or {}).get("items") or []:
+                if isinstance(source, dict):
+                    source_specs[str(source.get("canonical_key") or source.get("id") or "")] = source
+        generation_item = {
+            **item,
+            "prompt": SeedreamProvider._person_combination_text_prompt(
+                [str(key) for key in source_ids if str(key)], source_specs
+            ),
+        }
+
     created: list[dict[str, Any]] = []
     error = ""
     for _ in range(count):
@@ -652,7 +673,7 @@ def _generate_asset_candidate_images(
             generated = generate_method(
                 workspace_id=workspace_id,
                 source_kind=stage,
-                item=item,
+                item=generation_item,
                 feedback=feedback,
                 reference_url=str((base or {}).get("remote_url") or ""),
                 reference_local_path=str((base or {}).get("local_path") or ""),
@@ -675,6 +696,7 @@ def _generate_asset_candidate_images(
                 remote_url=str(generated.get("remote_url") or ""),
                 url=str(generated.get("url") or ""),
                 local_path=str(generated.get("local_path") or ""),
+                provenance=generated.get("provenance") if isinstance(generated.get("provenance"), dict) else {},
             )
         )
 
@@ -696,8 +718,8 @@ def generate_asset_candidates(
     if not db.get_workspace(workspace_id):
         raise HTTPException(404, "Workspace not found")
     artifact, item = _current_stage_asset(workspace_id, payload.stage, payload.canonical_key)
-    base = _current_stage_asset_candidates_base(workspace_id, payload.stage, payload.canonical_key, artifact, payload.base_candidate_id)
-    if base is None and payload.stage == "reference_images":
+    base = _current_stage_asset_candidates_base(workspace_id, payload.stage, payload.canonical_key, artifact, payload.base_candidate_id) if payload.use_base_reference else None
+    if base is None and payload.stage == "reference_images" and payload.use_base_reference:
         base = _reference_artifact_base(item)
     localization_context = _asset_candidate_localization_context(workspace_id)
     result = _generate_asset_candidate_images(
@@ -712,6 +734,8 @@ def generate_asset_candidates(
     )
     created = result["items"]
     if not created and result.get("error"):
+        if "参考图本地文件缺失，远端临时链接已失效" in str(result["error"]):
+            raise HTTPException(409, {"code": "reference_unavailable", "message": result["error"]})
         raise HTTPException(502, str(result["error"]))
     db.add_event(
         workspace_id,
@@ -806,7 +830,13 @@ def select_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, An
     if int(candidate.get("artifact_revision") or 0) != int(artifact.get("revision") or 0):
         raise HTTPException(409, "该候选图属于旧版本资产，请在当前 revision 重新抽图")
     selected = db.select_asset_candidate(workspace_id, candidate_id)
-    invalidated = orchestrator.invalidate_downstream(workspace_id, str(candidate.get("stage") or ""))
+    stage = str(candidate.get("stage") or "")
+    # A reference-image candidate changes the rendered visual input, not the
+    # locked storyboard/dialogue/sound content. Keep those revisions intact and
+    # require a fresh preview before batch rendering can proceed.
+    invalidated = orchestrator.invalidate_downstream(
+        workspace_id, "review" if stage == "reference_images" else stage
+    )
     if invalidated:
         db.clear_stage_reviews(workspace_id, invalidated)
         for gate_stage, gate_name in GATES.items():
@@ -858,7 +888,9 @@ def unselect_asset_candidate(workspace_id: str, candidate_id: str) -> dict[str, 
             )
         candidate = db.get_asset_candidate(candidate_id) or candidate
 
-    invalidated = orchestrator.invalidate_downstream(workspace_id, stage)
+    invalidated = orchestrator.invalidate_downstream(
+        workspace_id, "review" if stage == "reference_images" else stage
+    )
     if invalidated:
         db.clear_stage_reviews(workspace_id, invalidated)
         for gate_stage, gate_name in GATES.items():

@@ -210,6 +210,7 @@ class MockProvider(WorkflowProvider):
             return {
                 "shot_index": 1,
                 "provider_job_id": "mock-preview-001",
+                "model": "mock-video",
                 "url": "mock://video/preview/1",
                 "duration_seconds": 10,
                 "cost_units": 12,

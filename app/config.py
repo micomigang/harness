@@ -39,6 +39,13 @@ class Settings:
     image_model: str
     image_size: str
     image_max_assets: int
+    ark_account_id: str
+    tos_access_key: str
+    tos_secret_key: str
+    tos_endpoint: str
+    tos_region: str
+    tos_bucket: str
+    tos_account_id: str
     video_api_key: str
     video_base_url: str
     video_model: str
@@ -102,6 +109,13 @@ class Settings:
             ),
             image_size=os.getenv("IMAGE_SIZE", "2K"),
             image_max_assets=int(os.getenv("IMAGE_MAX_ASSETS", "6")),
+            ark_account_id=os.getenv("ARK_ACCOUNT_ID", "").strip(),
+            tos_access_key=os.getenv("TOS_ACCESS_KEY", ""),
+            tos_secret_key=os.getenv("TOS_SECRET_KEY", ""),
+            tos_endpoint=os.getenv("TOS_ENDPOINT", "").strip(),
+            tos_region=os.getenv("TOS_REGION", "").strip(),
+            tos_bucket=os.getenv("TOS_BUCKET", "").strip(),
+            tos_account_id=os.getenv("TOS_ACCOUNT_ID", "").strip(),
             video_api_key=os.getenv("VIDEO_API_KEY", ""),
             video_base_url=os.getenv(
                 "VIDEO_API_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"

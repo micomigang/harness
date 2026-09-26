@@ -198,6 +198,24 @@ def test_asset_candidates_are_revision_scoped_and_selection_is_exclusive(tmp_pat
     assert db.list_asset_candidates(ws["id"], artifact_revision=2)[0]["id"] == newer["id"]
 
 
+def test_asset_candidate_provenance_round_trips(tmp_path: Path):
+    db = _db(tmp_path)
+    ws = db.create_workspace("episode", "brief", {})
+    provenance = {
+        "model": "doubao-seedream-5-0-pro-260628",
+        "generation_mode": "text_to_image",
+        "account_id": "2131396012",
+        "media_format": "jpeg",
+        "sha256": "a" * 64,
+    }
+    candidate = db.add_asset_candidate(
+        ws["id"], "reference_images", 8, "char_a", "char_a",
+        provenance=provenance,
+    )
+    assert candidate["provenance"] == provenance
+    assert db.get_asset_candidate(candidate["id"])["provenance"] == provenance
+
+
 def test_delete_asset_candidates_for_stages_prevents_revision_collision(tmp_path: Path):
     db = _db(tmp_path)
     ws = db.create_workspace("episode", "brief", {})

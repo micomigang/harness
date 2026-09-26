@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from .agents import STAGE_AGENTS, agent_for_stage
 from .db import Database
+from .guidance import requested_preview_shot_index, sanitize_parameter_overrides
 from .providers import ProviderRegistry
 from .reference_plan import (
     canonical_combination_key,
@@ -235,6 +236,17 @@ class Orchestrator:
                 storyboard_content=(by_kind.get("storyboard") or {}).get("content", {}),
                 dialogue_content=(by_kind.get("dialogue_plan") or {}).get("content", {}),
             )
+        elif stage == "preview":
+            try:
+                expected_shot_index = requested_preview_shot_index(
+                    user_instruction,
+                    sanitize_parameter_overrides(
+                        stage, execution_directive.get("parameter_overrides")
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise OrchestrationError(str(exc)) from exc
+            self._validate_preview_contract(content, expected_shot_index)
         if progress_callback:
             progress_callback(94, "生成完成，正在保存产物")
         agent = agent_for_stage(stage)
@@ -306,6 +318,7 @@ class Orchestrator:
                 remote_url=str(item.get("remote_url") or ""),
                 url=str(item.get("url") or ""),
                 local_path=str(item.get("local_path") or ""),
+                provenance=item.get("provenance") if isinstance(item.get("provenance"), dict) else {},
                 selected=auto_selected,
             )
 
@@ -1169,6 +1182,7 @@ class Orchestrator:
                     "remote_url": str(candidate.get("remote_url") or ""),
                     "url": str(candidate.get("url") or ""),
                     "local_path": str(candidate.get("local_path") or ""),
+                    "provenance": candidate.get("provenance") or {},
                     "model": str(candidate.get("model") or item.get("model") or ""),
                     "status": "selected_candidate",
                     "binding_origin": "current_upstream_selected_candidate",
@@ -1284,6 +1298,7 @@ class Orchestrator:
                 "remote_url": str(historical.get("remote_url") or ""),
                 "url": str(historical.get("url") or ""),
                 "local_path": str(historical.get("local_path") or ""),
+                "provenance": historical.get("provenance") or {},
                 "status": "selected_candidate" if historical.get("selected") else "candidate",
                 "origin": "reference_candidate_history_reuse",
                 "input_candidate_ids": input_ids,
@@ -1415,6 +1430,7 @@ class Orchestrator:
                 remote_url=str(candidate.get("remote_url") or ""),
                 url=str(candidate.get("url") or ""),
                 local_path=str(candidate.get("local_path") or ""),
+                provenance=candidate.get("provenance") if isinstance(candidate.get("provenance"), dict) else {},
                 selected=bool(candidate.get("selected")),
             )
 
@@ -2562,6 +2578,72 @@ class Orchestrator:
         }
         return guarded
 
+    @staticmethod
+    def _validate_preview_contract(
+        content: dict[str, Any], expected_shot_index: int | None = None
+    ) -> None:
+        if not isinstance(content, dict):
+            raise OrchestrationError("单镜预览产物格式无效")
+        required = ("shot_index", "provider_job_id", "model", "url", "status")
+        missing = [key for key in required if not content.get(key)]
+        if missing:
+            raise OrchestrationError(
+                "单镜预览产物缺少必需追踪字段：" + ", ".join(missing)
+            )
+        if type(content["shot_index"]) is not int or content["shot_index"] < 1:
+            raise OrchestrationError("单镜预览产物的 shot_index 无效")
+        if expected_shot_index is not None and content["shot_index"] != expected_shot_index:
+            raise OrchestrationError(
+                f"单镜预览镜头不匹配：要求 shot_index={expected_shot_index}，"
+                f"实际为 {content['shot_index']}；已停止保存产物"
+            )
+        if str(content["status"]).lower() != "succeeded":
+            raise OrchestrationError("单镜预览产物状态不是 succeeded")
+
+    @classmethod
+    def _guard_preview_review(
+        cls, review: dict[str, Any], artifact: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Use persisted preview metadata as authority over a reviewer's omissions."""
+        guarded = dict(review)
+        content = artifact.get("content") if isinstance(artifact, dict) else None
+        try:
+            cls._validate_preview_contract(content)
+        except (OrchestrationError, TypeError, AttributeError):
+            return guarded
+        markers = (
+            "shot_index", "provider_job_id", "model", "metadata", "元数据",
+            "追踪字段", "字段缺", "字段不", "output schema", "record schema",
+        )
+        def is_false_missing(item: Any) -> bool:
+            blob = json.dumps(item, ensure_ascii=False).casefold()
+            return any(marker.casefold() in blob for marker in markers) and any(
+                word in blob for word in ("缺", "missing", "not as", "补全", "enrich", "incomplete", "must be inferred")
+            )
+        deviations = guarded.get("deviations") if isinstance(guarded.get("deviations"), list) else []
+        suggestions = guarded.get("suggested_adjustments") if isinstance(guarded.get("suggested_adjustments"), list) else []
+        suppressed = [item for item in deviations if is_false_missing(item)]
+        kept = [item for item in deviations if not is_false_missing(item)]
+        guarded["deviations"] = kept
+        guarded["suggested_adjustments"] = [item for item in suggestions if not is_false_missing(item)]
+        if suppressed:
+            guarded["assessment"] = "Preview file and all five required tracking fields are present."
+            guarded["reply"] = (
+                "单镜预览已生成，shot_index、provider_job_id、model、url、status "
+                "均已在产物中核实。请审阅视频画面；batch_video 仍需你明确批准。"
+            )
+            guarded["memory_candidates"] = [
+                item for item in guarded.get("memory_candidates", [])
+                if not is_false_missing(item)
+            ]
+        guarded["harness_review_guard"] = {
+            "preview_contract_status": "pass",
+            "structural_authority": "artifact.content",
+            "suppressed_structural_deviations": suppressed,
+            "remaining_deviations": kept,
+        }
+        return guarded
+
     def _post_generation_review(
         self,
         *,
@@ -2606,6 +2688,8 @@ class Orchestrator:
             review = self._guard_dialogue_plan_review(review, artifact)
         elif stage == "sound_plan" and review:
             review = self._guard_sound_plan_review(review, artifact)
+        elif stage == "preview" and review:
+            review = self._guard_preview_review(review, artifact)
         reply = str(review.get("reply") or "").strip()
         if not reply:
             next_actions = context["next_actions"]
@@ -3587,6 +3671,7 @@ class Orchestrator:
                 content = dict(target.get("content") or {})
                 content["reference_image"] = {
                     "url": ref.get("url"), "remote_url": ref.get("remote_url"), "local_path": ref.get("local_path"),
+                    "provenance": ref.get("provenance") or {},
                     "source_workspace_id": workspace_id, "source_revision": refs.get("revision"),
                 }
                 self.db.update_asset_item(

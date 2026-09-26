@@ -3,14 +3,19 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import re
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
 from .base import WorkflowProvider
-from app.guidance import sanitize_parameter_overrides
+from app.guidance import requested_preview_shot_index, sanitize_parameter_overrides
+from app.image_provenance import contains_person, image_format, sha256_file
+from app.tos_archive import TosArchive
 
 
 class SeedanceError(RuntimeError):
@@ -63,6 +68,9 @@ class SeedanceProvider(WorkflowProvider):
         output_dir: Path,
         client: httpx.Client | None = None,
         sleeper: Callable[[float], None] = time.sleep,
+        account_id: str = "",
+        original_archive: TosArchive | None = None,
+        preflight_enabled: bool = False,
     ):
         if not api_key or not model:
             raise ValueError("VIDEO_API_KEY and VIDEO_MODEL are required")
@@ -80,6 +88,9 @@ class SeedanceProvider(WorkflowProvider):
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._client = client
         self._sleep = sleeper
+        self.account_id = account_id.strip()
+        self.original_archive = original_archive
+        self.preflight_enabled = preflight_enabled
 
     def generate(self, stage: str, context: dict[str, Any]) -> dict[str, Any]:
         shots = self._storyboard_shots(context)
@@ -94,12 +105,24 @@ class SeedanceProvider(WorkflowProvider):
             "generate_audio": params.get("generate_audio", self.generate_audio),
             "prompt_addendum": str(directive.get("prompt_addendum") or "").strip(),
         }
+        max_reference_images = 30 if "seedance-2-5" in self.model.lower() else 9
         if stage == "preview":
             if not shots:
                 raise SeedanceError("Storyboard has no shots")
-            shot = shots[0]
-            shot_index = int(shot.get("index", 1))
-            reference_urls, reference_keys = self._shot_reference_urls(context, shot)
+            try:
+                shot_index = requested_preview_shot_index(
+                    context.get("user_instruction", ""), params
+                )
+            except (TypeError, ValueError) as exc:
+                raise SeedanceError(str(exc)) from exc
+            selected = [shot for shot in shots if int(shot.get("index", 0)) == shot_index]
+            if len(selected) != 1:
+                raise SeedanceError(f"Storyboard does not contain exactly one shot_index={shot_index}")
+            shot = selected[0]
+            reference_urls, reference_keys = self._shot_reference_urls(
+                context, shot, max_images=max_reference_images
+            )
+            reference_urls = self._preflight_reference_urls(context, reference_keys, reference_urls)
             return self._generate_one(
                 workspace_id,
                 shot,
@@ -116,10 +139,19 @@ class SeedanceProvider(WorkflowProvider):
             items: list[dict[str, Any]] = []
             batch_max_shots = int(params.get("batch_max_shots", self.batch_max_shots))
             selected = shots[: batch_max_shots]
+            prepared: list[tuple[dict[str, Any], list[str], list[str]]] = []
+            # Check the complete batch before creating any billable video task.
             for shot in selected:
+                reference_urls, reference_keys = self._shot_reference_urls(
+                    context, shot, max_images=max_reference_images
+                )
+                reference_urls = self._preflight_reference_urls(
+                    context, reference_keys, reference_urls
+                )
+                prepared.append((shot, reference_urls, reference_keys))
+            for shot, reference_urls, reference_keys in prepared:
                 try:
                     shot_index = int(shot.get("index", 1))
-                    reference_urls, reference_keys = self._shot_reference_urls(context, shot)
                     items.append(
                         self._generate_one(
                             workspace_id,
@@ -160,14 +192,14 @@ class SeedanceProvider(WorkflowProvider):
 
     @staticmethod
     def _reference_input_value(item: dict[str, Any]) -> str:
-        """Return an Ark-readable reference image value.
-
-        Prefer the locally cached production-truth image and inline it as a data
-        URI. Seedream provider URLs may be temporary or protected from server-side
-        fetching, which makes them unsuitable as cross-provider references. Ark's
-        video API accepts data:image/...;base64,... for image_url.url, so using
-        the cached bytes avoids public-URL reachability and expiry problems.
-        """
+        """Resolve transport bytes; strict human provenance is checked separately."""
+        # Ark can trust an unmodified Seedream 5.0 output from the same account.
+        # A locally re-encoded copy loses that provenance, so use the original
+        # signed output URL while it remains valid. Strict preflight rejects a
+        # local fallback for person-containing images before task creation.
+        remote = str(item.get("remote_url") or "").strip()
+        if "seedream-5-0" in str(item.get("model") or "").lower() and SeedanceProvider._valid_ark_output_url(remote):
+            return remote
         local = Path(str(item.get("local_path") or ""))
         if local.is_file():
             size = local.stat().st_size
@@ -190,15 +222,50 @@ class SeedanceProvider(WorkflowProvider):
                 return value
         return ""
 
+    @staticmethod
+    def _valid_ark_output_url(url: str) -> bool:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or not parsed.hostname or not parsed.hostname.endswith(".volces.com"):
+            return False
+        params = parse_qs(parsed.query)
+        try:
+            signed_at = datetime.strptime(params["X-Tos-Date"][0], "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            expiry = signed_at + timedelta(seconds=int(params["X-Tos-Expires"][0]))
+        except (KeyError, IndexError, ValueError, OverflowError):
+            return False
+        return datetime.now(timezone.utc) + timedelta(minutes=5) < expiry
+
     @classmethod
     def _reference_items(cls, context: dict[str, Any]) -> list[dict[str, Any]]:
+        selected_by_key = {
+            str(candidate.get("canonical_key") or "").strip(): candidate
+            for candidate in context.get("asset_candidates", []) or []
+            if isinstance(candidate, dict)
+            and candidate.get("stage") == "reference_images"
+            and candidate.get("selected")
+            and str(candidate.get("canonical_key") or "").strip()
+        }
         for artifact in context.get("artifacts", []):
             if artifact.get("kind") == "reference_images":
-                return [
-                    item
-                    for item in artifact.get("content", {}).get("items", [])
-                    if isinstance(item, dict)
-                ]
+                items = []
+                for item in artifact.get("content", {}).get("items", []):
+                    if not isinstance(item, dict):
+                        continue
+                    key = str(item.get("canonical_key") or item.get("reference_key") or "").strip()
+                    selected = selected_by_key.get(key)
+                    if selected:
+                        # Candidate selection is the current visual authority. The
+                        # storyboard may still carry the previous candidate_id;
+                        # retain its canonical binding but use the selected bytes.
+                        item = {
+                            **item,
+                            **{field: selected.get(field) for field in (
+                                "model", "remote_url", "url", "local_path", "provenance"
+                            )},
+                            "candidate_id": selected["id"],
+                        }
+                    items.append(item)
+                return items
         return []
 
     @classmethod
@@ -212,7 +279,7 @@ class SeedanceProvider(WorkflowProvider):
 
     @classmethod
     def _shot_reference_urls(
-        cls, context: dict[str, Any], shot: dict[str, Any]
+        cls, context: dict[str, Any], shot: dict[str, Any], *, max_images: int = 9
     ) -> tuple[list[str], list[str]]:
         """Resolve provider-reachable references for exactly this shot.
 
@@ -222,7 +289,10 @@ class SeedanceProvider(WorkflowProvider):
         because one composition can preserve several bound assets at once.
         """
         items = cls._reference_items(context)
+        bindings = (shot.get("asset_bindings") or {}).get("reference_images") or []
         if not items:
+            if bindings:
+                raise SeedanceError("镜头已绑定参考图，但 reference_images 产物缺失")
             return [], []
 
         by_candidate: dict[str, dict[str, Any]] = {}
@@ -241,9 +311,10 @@ class SeedanceProvider(WorkflowProvider):
                 if signature:
                     by_signature[signature] = item
 
-        bindings = (shot.get("asset_bindings") or {}).get("reference_images") or []
         if not isinstance(bindings, list) or not bindings:
             return cls._reference_urls(context), []
+        if len(bindings) > max_images:
+            raise SeedanceError(f"当前视频模型最多支持 {max_images} 张参考图")
 
         def priority(binding: Any) -> int:
             if isinstance(binding, dict):
@@ -257,6 +328,7 @@ class SeedanceProvider(WorkflowProvider):
 
         urls: list[str] = []
         keys: list[str] = []
+        unresolved: list[str] = []
         for binding in sorted(bindings, key=priority):
             matched: dict[str, Any] | None = None
             display_key = ""
@@ -281,24 +353,125 @@ class SeedanceProvider(WorkflowProvider):
                     if direct_url and direct_url not in urls:
                         urls.append(direct_url)
                         keys.append(display_key or candidate_id or "direct_reference")
-                        if len(urls) >= 4:
-                            break
+                    elif not direct_url:
+                        unresolved.append(display_key or candidate_id or "unknown_reference")
                     continue
             if matched is None:
+                unresolved.append(display_key or "unknown_reference")
                 continue
             url = cls._reference_input_value(matched)
-            if not url or url in urls:
+            if not url:
+                unresolved.append(display_key or "unknown_reference")
+                continue
+            if url in urls:
                 continue
             urls.append(url)
             keys.append(
                 str(matched.get("canonical_key") or matched.get("id") or display_key or "reference")
             )
-            if len(urls) >= 4:
-                break
-
-        if not urls:
-            return cls._reference_urls(context), []
+        if unresolved:
+            raise SeedanceError("镜头参考图不可用：" + ", ".join(unresolved))
         return urls, keys
+
+    def _preflight_reference_urls(
+        self, context: dict[str, Any], keys: list[str], urls: list[str]
+    ) -> list[str]:
+        if not self.preflight_enabled:
+            return urls
+        by_key = {
+            str(item.get("canonical_key") or item.get("reference_key") or ""): item
+            for item in self._reference_items(context)
+        }
+        checked: list[str] = []
+        failures: list[str] = []
+        client, owns_client = self._get_client()
+        try:
+            for key, supplied_url in zip(keys, urls):
+                item = by_key.get(key)
+                if not item:
+                    failures.append(f"镜头参考图 {key} 缺少可核验的来源记录")
+                    continue
+                try:
+                    checked.append(self._preflight_one_reference(client, key, item, supplied_url))
+                except SeedanceError as exc:
+                    failures.append(str(exc))
+        finally:
+            if owns_client:
+                client.close()
+        if failures:
+            raise SeedanceError("镜头参考图预检未通过：" + "；".join(failures))
+        return checked
+
+    def _preflight_one_reference(
+        self, client: httpx.Client, key: str, item: dict[str, Any], supplied_url: str
+    ) -> str:
+        url = supplied_url
+        if contains_person(item):
+            provenance = item.get("provenance") or {}
+            origin = str(provenance.get("origin") or "")
+            if origin == "ark_preset" and str(provenance.get("asset_id") or "").startswith("asset://"):
+                url = str(provenance["asset_id"])
+            elif origin == "authorized_person" and provenance.get("authorization_id"):
+                if not url.startswith("https://"):
+                    raise SeedanceError(f"镜头参考图 {key} 的授权人像缺少可访问 URL")
+            else:
+                self._validate_original_person(key, item, provenance)
+                remote = str(item.get("remote_url") or "")
+                tos_uri = str(provenance.get("tos_uri") or "")
+                if self._valid_ark_output_url(remote):
+                    url = remote
+                elif tos_uri and self.original_archive and self.original_archive.enabled:
+                    try:
+                        url = self.original_archive.signed_get_url(tos_uri)
+                    except Exception as exc:
+                        raise SeedanceError(f"镜头参考图 {key} 的 TOS 原始文件无法签名：{exc}") from exc
+                else:
+                    raise SeedanceError(
+                        f"镜头参考图 {key} 的原始 URL 已失效，且没有可用的同账号 TOS 原始文件；"
+                        "已停止提交，不会回退到本地 Base64"
+                    )
+        if url.startswith("https://"):
+            try:
+                with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as response:
+                    response.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise SeedanceError(f"镜头参考图 {key} 的提交 URL 不可访问：{exc}") from exc
+        elif url.startswith("data:image/"):
+            local = Path(str(item.get("local_path") or ""))
+            if not local.is_file():
+                raise SeedanceError(f"镜头参考图 {key} 的本地文件缺失")
+        elif not url.startswith("asset://"):
+            raise SeedanceError(f"镜头参考图 {key} 没有可提交的图片地址")
+        return url
+
+    def _validate_original_person(
+        self, key: str, item: dict[str, Any], provenance: dict[str, Any]
+    ) -> None:
+        if not self.account_id:
+            raise SeedanceError(f"镜头参考图 {key} 无法核验同账号来源：请配置 ARK_ACCOUNT_ID")
+        if provenance.get("provider") != "volcengine-ark" or provenance.get("account_id") != self.account_id:
+            raise SeedanceError(f"镜头参考图 {key} 缺少同账号方舟原始产物记录")
+        model = str(provenance.get("model") or item.get("model") or "").lower()
+        if provenance.get("generation_mode") != "text_to_image" or not re.search(r"seedream-5-0-(?:pro|lite)", model):
+            raise SeedanceError(f"镜头参考图 {key} 不是受信的 Seedream 5.0 pro/lite 文生图原始产物")
+        try:
+            generated = datetime.fromisoformat(str(provenance["generated_at"]).replace("Z", "+00:00"))
+            if generated.tzinfo is None:
+                raise ValueError("timezone missing")
+        except (KeyError, ValueError, TypeError) as exc:
+            raise SeedanceError(f"镜头参考图 {key} 缺少有效生成时间") from exc
+        now = datetime.now(timezone.utc)
+        if generated.astimezone(timezone.utc) < datetime(2026, 4, 16, tzinfo=timezone.utc) or not (generated <= now < generated + timedelta(days=30)):
+            raise SeedanceError(f"镜头参考图 {key} 已超出方舟人像原始产物的 30 天受信期")
+        local = Path(str(item.get("local_path") or ""))
+        if not local.is_file() or not provenance.get("format_verified") or not provenance.get("original_bytes"):
+            raise SeedanceError(f"镜头参考图 {key} 缺少可核验的未改动原始文件")
+        with local.open("rb") as original:
+            detected_format = image_format(original.read(16))
+        if sha256_file(local) != provenance.get("sha256") or detected_format != provenance.get("media_format"):
+            raise SeedanceError(f"镜头参考图 {key} 的原始文件格式或 SHA-256 校验失败")
+        if str(provenance.get("original_url") or "") != str(item.get("remote_url") or ""):
+            raise SeedanceError(f"镜头参考图 {key} 的原始 URL 与来源记录不一致")
 
     @staticmethod
     def _plan_by_shot(
@@ -349,6 +522,18 @@ class SeedanceProvider(WorkflowProvider):
                 )
             except SeedanceAPIError as exc:
                 primary_error = exc
+                if exc.error_code.startswith("InputImageSensitiveContentDetected"):
+                    affected = [
+                        reference_keys[int(index) - 1]
+                        for index in re.findall(r"content\[(\d+)\]", str(exc))
+                        if 1 <= int(index) <= len(reference_keys)
+                    ]
+                    names = ", ".join(dict.fromkeys(affected)) or "未知参考图"
+                    raise SeedanceError(
+                        f"Seedance 拒绝了含人物图像的参考素材：{names}。"
+                        "请使用火山方舟支持的可信原始模型产物、预置虚拟人像或已授权真人素材。"
+                        f"原始错误：{exc}"
+                    ) from exc
                 if not self._should_try_fallback(exc, duration):
                     raise
                 model = self.fallback_model

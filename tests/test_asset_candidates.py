@@ -1,4 +1,5 @@
 import app.main as main_module
+import pytest
 
 
 class FakeImageProvider:
@@ -88,6 +89,45 @@ def test_asset_candidate_route_is_registered():
     assert "/api/workspaces/{workspace_id}/asset-candidates/{candidate_id}/select" in paths
 
 
+def test_selecting_reference_candidate_only_invalidates_rendered_outputs(monkeypatch):
+    class SelectionDB(FakeDB):
+        def get_artifact(self, workspace_id, stage):
+            return {"revision": 8, "status": "ready", "content": {"items": [{
+                "canonical_key": "combo__char_youngwoman__scene_salon"
+            }]}}
+
+        def get_asset_candidate(self, candidate_id):
+            return {
+                "id": candidate_id, "workspace_id": "ws", "stage": "reference_images",
+                "artifact_revision": 8, "canonical_key": "combo__char_youngwoman__scene_salon",
+            }
+
+        def select_asset_candidate(self, workspace_id, candidate_id):
+            return {**self.get_asset_candidate(candidate_id), "selected": True}
+
+        def clear_stage_reviews(self, workspace_id, stages):
+            self.cleared = stages
+
+        def set_approval(self, workspace_id, gate, status, note):
+            self.approval = (gate, status)
+
+    class SelectionOrchestrator:
+        def invalidate_downstream(self, workspace_id, changed_kind):
+            self.changed_kind = changed_kind
+            return ["preview"]
+
+    fake_db = SelectionDB()
+    fake_orchestrator = SelectionOrchestrator()
+    monkeypatch.setattr(main_module, "db", fake_db)
+    monkeypatch.setattr(main_module, "orchestrator", fake_orchestrator)
+
+    result = main_module.select_asset_candidate("ws", "fresh-original")
+    assert result["candidate"]["selected"] is True
+    assert fake_orchestrator.changed_kind == "review"
+    assert fake_db.cleared == ["preview"]
+    assert fake_db.approval == ("preview_approved", "pending")
+
+
 def test_generate_asset_candidate_is_scoped_to_one_asset(monkeypatch):
     fake_db = FakeDB()
     image = FakeImageProvider()
@@ -108,6 +148,52 @@ def test_generate_asset_candidate_is_scoped_to_one_asset(monkeypatch):
     assert all(item["canonical_key"] == "char_grandmere" for item in result["items"])
     assert all(call["feedback"] == "older face, keep coat" for call in image.calls)
     assert all(call["item"]["canonical_key"] == "char_grandmere" for call in image.calls)
+
+
+def test_fresh_candidate_ignores_missing_selected_image(monkeypatch):
+    class SelectedDB(FakeDB):
+        def list_asset_candidates(self, *args, **kwargs):
+            return [{
+                "id": "old-selected",
+                "remote_url": "https://files.example/expired.png",
+                "local_path": r"F:\oiioii-harness\data\outputs\missing.png",
+                "selected": True,
+            }]
+
+    fake_db = SelectedDB()
+    image = FakeImageProvider()
+    monkeypatch.setattr(main_module, "db", fake_db)
+    monkeypatch.setattr(main_module, "orchestrator", FakeOrchestrator(image))
+
+    main_module.generate_asset_candidates(
+        "ws",
+        main_module.AssetCandidateGenerateRequest(
+            stage="characters",
+            canonical_key="char_grandmere",
+            use_base_reference=False,
+        ),
+    )
+    assert image.calls[0]["reference_url"] == ""
+    assert image.calls[0]["reference_local_path"] == ""
+
+
+def test_missing_reference_returns_recoverable_error(monkeypatch):
+    class MissingImageProvider(FakeImageProvider):
+        def generate_candidate(self, **kwargs):
+            raise RuntimeError("参考图本地文件缺失，远端临时链接已失效。请恢复原图，或选择“按文字重画”生成新的候选图。")
+
+    monkeypatch.setattr(main_module, "db", FakeDB())
+    monkeypatch.setattr(main_module, "orchestrator", FakeOrchestrator(MissingImageProvider()))
+
+    with pytest.raises(main_module.HTTPException) as exc:
+        main_module.generate_asset_candidates(
+            "ws",
+            main_module.AssetCandidateGenerateRequest(
+                stage="characters", canonical_key="char_grandmere",
+            ),
+        )
+    assert exc.value.status_code == 409
+    assert exc.value.detail["code"] == "reference_unavailable"
 
 
 def test_candidate_route_passes_target_market_to_image_provider(monkeypatch):

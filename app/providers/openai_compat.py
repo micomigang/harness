@@ -492,7 +492,7 @@ class OpenAICompatibleProvider(WorkflowProvider):
             "continuity_rules", "adaptation_notes", "open_questions",
             "source_fact_register", "adaptation_decisions", "asset_requirements",
             "items", "manifest_validation", "shots", "checks", "blocking_failures", "status", "note",
-            "estimated_seconds", "storyboard_validation", "dialogue_validation", "sound_validation", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed"
+            "estimated_seconds", "storyboard_validation", "dialogue_validation", "sound_validation", "shot_index", "provider_job_id", "model", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed"
         ):
             if key not in content:
                 continue

@@ -3,7 +3,7 @@ from pathlib import Path
 from app.db import Database
 from app.orchestrator import Orchestrator
 from app.providers.mock import MockProvider
-from app.guidance import sanitize_parameter_overrides
+from app.guidance import requested_preview_shot_index, sanitize_parameter_overrides
 
 
 class PlanningProvider(MockProvider):
@@ -168,3 +168,15 @@ def test_asset_library_context_invalidates_bound_plan(tmp_path: Path):
     lib = db.create_asset_library("France Family", "France contemporary", scope="character")
     db.link_workspace_asset_library(ws["id"], lib["id"])
     assert not orchestrator.validate_bound_plan(ws["id"], "analysis", chat["input_hash"])["valid"]
+
+
+def test_preview_shot_index_follows_explicit_user_target():
+    assert requested_preview_shot_index("第 3 镜（shot_index 3）") == 3
+    assert requested_preview_shot_index("Preview shot 3", {"shot_index": 3}) == 3
+    assert requested_preview_shot_index("") == 1
+    try:
+        requested_preview_shot_index("shot_index 3", {"shot_index": 1})
+    except ValueError as exc:
+        assert "不一致" in str(exc)
+    else:
+        raise AssertionError("conflicting preview targets must fail")

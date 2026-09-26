@@ -173,6 +173,7 @@ class Database:
                     remote_url TEXT NOT NULL,
                     url TEXT NOT NULL,
                     local_path TEXT NOT NULL,
+                    provenance_json TEXT NOT NULL DEFAULT '{}',
                     selected INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -189,6 +190,11 @@ class Database:
                 conn.execute(
                     "ALTER TABLE jobs ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            candidate_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(asset_candidates)").fetchall()
+            }
+            if "provenance_json" not in candidate_columns:
+                conn.execute("ALTER TABLE asset_candidates ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '{}'")
             asset_library_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(asset_libraries)").fetchall()
             }
@@ -1002,7 +1008,7 @@ class Database:
         self, workspace_id: str, stage: str, artifact_revision: int, canonical_key: str,
         source_id: str, *, feedback: str = "", base_candidate_id: str = "", prompt: str = "",
         model: str = "", remote_url: str = "", url: str = "", local_path: str = "",
-        selected: bool = False,
+        selected: bool = False, provenance: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         candidate_id = str(uuid.uuid4())
         now = utcnow()
@@ -1013,8 +1019,8 @@ class Database:
                     (now, workspace_id, stage, int(artifact_revision), canonical_key),
                 )
             conn.execute(
-                "INSERT INTO asset_candidates (id, workspace_id, stage, artifact_revision, canonical_key, source_id, feedback, base_candidate_id, prompt, model, remote_url, url, local_path, selected, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (candidate_id, workspace_id, stage, int(artifact_revision), canonical_key, source_id, feedback, base_candidate_id, prompt, model, remote_url, url, local_path, 1 if selected else 0, now, now),
+                "INSERT INTO asset_candidates (id, workspace_id, stage, artifact_revision, canonical_key, source_id, feedback, base_candidate_id, prompt, model, remote_url, url, local_path, provenance_json, selected, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (candidate_id, workspace_id, stage, int(artifact_revision), canonical_key, source_id, feedback, base_candidate_id, prompt, model, remote_url, url, local_path, json.dumps(provenance or {}, ensure_ascii=False), 1 if selected else 0, now, now),
             )
             row = conn.execute("SELECT * FROM asset_candidates WHERE id=?", (candidate_id,)).fetchone()
         return self._asset_candidate(row)
@@ -1134,6 +1140,7 @@ class Database:
     def _asset_candidate(row: sqlite3.Row) -> dict[str, Any]:
         item = dict(row)
         item["selected"] = bool(item.get("selected"))
+        item["provenance"] = json.loads(item.pop("provenance_json", "{}") or "{}")
         return item
 
     @staticmethod

@@ -644,3 +644,17 @@ def test_review_stage_upstream_keeps_full_sound_and_review_contracts():
     by_kind = {item["kind"]: item for item in upstream}
     assert len(by_kind["sound_plan"]["content"]["items"]) == 14
     assert len(by_kind["review"]["content"]["checks"]) == 12
+
+
+def test_preview_review_context_includes_tracking_fields():
+    content = {
+        "shot_index": 1,
+        "provider_job_id": "cgt-123",
+        "model": "doubao-seedance-2-5-260628",
+        "url": "/media/shot-001.mp4",
+        "status": "succeeded",
+    }
+    preview = OpenAICompatibleProvider._director_artifact_preview(
+        {"kind": "preview", "status": "ready", "revision": 1, "content": content}
+    )
+    assert all(preview["content"][key] == value for key, value in content.items())

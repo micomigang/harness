@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<9"]
+tos = ["tos>=2.9,<3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

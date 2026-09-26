@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.config import settings
+from app.tos_archive import TosArchive
 
 from .base import WorkflowProvider
 from .hybrid import RoutedProvider
@@ -41,6 +42,17 @@ class ProviderRegistry:
                 read_timeout_seconds=settings.openai_read_timeout_seconds,
             )
         if settings.provider in {"kimi-seedance", "hybrid"}:
+            if settings.tos_bucket and (
+                not settings.ark_account_id or settings.tos_account_id != settings.ark_account_id
+            ):
+                raise ValueError("TOS_ACCOUNT_ID must match ARK_ACCOUNT_ID before archiving originals")
+            original_archive = TosArchive(
+                access_key=settings.tos_access_key,
+                secret_key=settings.tos_secret_key,
+                endpoint=settings.tos_endpoint,
+                region=settings.tos_region,
+                bucket=settings.tos_bucket,
+            )
             return RoutedProvider(
                 llm=OpenAICompatibleProvider(
                     api_key=settings.openai_api_key,
@@ -72,6 +84,8 @@ class ProviderRegistry:
                     size=settings.image_size,
                     max_assets=settings.image_max_assets,
                     output_dir=settings.data_dir / "outputs",
+                    account_id=settings.ark_account_id,
+                    original_archive=original_archive,
                 ),
                 video=SeedanceProvider(
                     api_key=settings.video_api_key,
@@ -85,6 +99,9 @@ class ProviderRegistry:
                     poll_timeout_seconds=settings.video_poll_timeout_seconds,
                     batch_max_shots=settings.video_batch_max_shots,
                     output_dir=settings.data_dir / "outputs",
+                    account_id=settings.ark_account_id,
+                    original_archive=original_archive,
+                    preflight_enabled=True,
                 ),
                 media=LocalMediaProvider(
                     ffmpeg_path=settings.ffmpeg_path,

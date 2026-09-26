@@ -17,6 +17,7 @@ DIRECTOR_PARAMETER_RULES: dict[str, dict[str, str]] = {
         "max_assets": "integer 1-12; maximum Seedream reference images to generate",
     },
     "preview": {
+        "shot_index": "integer 1-100; storyboard shot to preview",
         "resolution": "one of 480p, 720p, 1080p",
         "ratio": "one of 9:16, 16:9, 1:1",
         "generate_audio": "boolean",
@@ -47,6 +48,7 @@ _PARAMETER_CUES: dict[str, dict[str, tuple[str, ...]]] = {
         "max_assets": ("参考图", "资产图", "张", "image", "asset"),
     },
     "preview": {
+        "shot_index": ("shot_index", "第", "镜", "shot"),
         "resolution": ("480p", "720p", "1080p", "分辨率", "resolution"),
         "ratio": ("9:16", "16:9", "1:1", "画幅", "比例", "ratio"),
         "generate_audio": ("声音", "音频", "audio", "静音"),
@@ -92,6 +94,7 @@ def _explicit_parameter_authorization(stage: str, key: str, user_instruction: st
         "storyboard_count",
         "max_assets",
         "batch_max_shots",
+        "shot_index",
         "video_crf",
         "audio_bitrate_kbps",
     }:
@@ -128,6 +131,10 @@ def sanitize_parameter_overrides(
                 result[key] = max(1, min(6, int(raw)))
             elif stage == "storyboard" and key == "storyboard_count":
                 result[key] = max(1, min(100, int(raw)))
+            elif stage == "preview" and key == "shot_index":
+                index = int(raw)
+                if 1 <= index <= 100:
+                    result[key] = index
             elif stage == "reference_images" and key == "max_assets":
                 result[key] = max(1, min(12, int(raw)))
             elif stage in {"preview", "batch_video"} and key == "resolution":
@@ -154,3 +161,29 @@ def sanitize_parameter_overrides(
         except (TypeError, ValueError):
             continue
     return result
+
+
+def requested_preview_shot_index(
+    user_instruction: str, parameter_overrides: dict[str, Any] | None = None
+) -> int:
+    """Resolve an explicit preview target; reject conflicting targets before billing."""
+    instruction = str(user_instruction or "")
+    matches = [int(value) for value in re.findall(
+        r"\bshot_index\s*[:=]?\s*(\d+)\b", instruction, flags=re.IGNORECASE
+    )]
+    if not matches:
+        matches = [int(value) for value in re.findall(r"第\s*(\d+)\s*镜", instruction)]
+    if not matches:
+        matches = [int(value) for value in re.findall(r"\bshot\s*#?\s*(\d+)\b", instruction, flags=re.IGNORECASE)]
+    if len(set(matches)) > 1:
+        raise ValueError("单镜预览指令包含相互冲突的 shot_index")
+    explicit = matches[0] if matches else None
+    override = (parameter_overrides or {}).get("shot_index")
+    if override is not None:
+        override = int(override)
+        if override < 1 or explicit is not None and override != explicit:
+            raise ValueError("单镜预览的 shot_index 参数与用户指令不一致")
+    selected = explicit or override or 1
+    if selected < 1:
+        raise ValueError("单镜预览的 shot_index 无效")
+    return selected

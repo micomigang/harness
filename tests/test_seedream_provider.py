@@ -2,7 +2,8 @@ from pathlib import Path
 
 import httpx
 
-from app.providers.seedream import SeedreamProvider
+from app.providers.seedream import SeedreamError, SeedreamProvider
+import pytest
 
 
 def test_reference_image_generates_and_downloads(tmp_path: Path):
@@ -53,6 +54,43 @@ def test_reference_image_generates_and_downloads(tmp_path: Path):
     assert Path(item["local_path"]).read_bytes() == b"fake-png"
     assert '"size":"2K"' in payloads[0]
     assert '"sequential_image_generation"' not in payloads[0]
+
+
+def test_original_jpeg_keeps_bytes_format_and_provenance(tmp_path: Path):
+    from datetime import datetime, timezone
+    import hashlib
+
+    signed_at = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    original_url = (
+        "https://ark-acg-cn-beijing.tos-cn-beijing.volces.com/Image/2131396012/original.jpeg"
+        f"?X-Tos-Date={signed_at}&X-Tos-Expires=86400"
+    )
+    raw = b"\xff\xd8\xff\xe0original-jpeg-bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, json={"data": [{"url": original_url}]})
+        if str(request.url) == original_url:
+            return httpx.Response(200, content=raw)
+        return httpx.Response(404)
+
+    provider = SeedreamProvider(
+        api_key="test", base_url="https://ark.example/api/v3",
+        model="doubao-seedream-5-0-pro-260628", output_dir=tmp_path,
+        account_id="2131396012", client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    result = provider.generate_candidate(
+        workspace_id="w", source_kind="reference_images",
+        item={"id": "combo__char_woman__scene_room", "canonical_key": "combo__char_woman__scene_room", "prompt": "French woman in salon"},
+    )
+    assert Path(result["local_path"]).suffix == ".jpg"
+    assert Path(result["local_path"]).read_bytes() == raw
+    provenance = result["provenance"]
+    assert provenance["generation_mode"] == "text_to_image"
+    assert provenance["account_id"] == "2131396012"
+    assert provenance["media_format"] == "jpeg"
+    assert provenance["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert provenance["format_verified"] is True
 
 
 def test_reference_image_honors_director_prompt_and_asset_cap(tmp_path: Path):
@@ -136,6 +174,31 @@ def test_targeted_candidate_uses_selected_image_as_edit_reference(tmp_path: Path
     assert "sequential_image_generation" not in posted[0]
     assert "Change only what the art director asks" in posted[0]["prompt"]
     assert "manteau rouge" in posted[0]["prompt"]
+
+
+def test_expired_signed_reference_fails_before_generation(tmp_path: Path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("Expired reference must not be sent to Seedream")
+
+    provider = SeedreamProvider(
+        api_key="test-key",
+        base_url="https://ark.example/api/v3",
+        model="seedream",
+        output_dir=tmp_path,
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    expired = (
+        "https://files.example/base.png?X-Tos-Date=20200101T000000Z"
+        "&X-Tos-Expires=86400"
+    )
+    with pytest.raises(SeedreamError, match="按文字重画"):
+        provider.generate_candidate(
+            workspace_id="w",
+            source_kind="characters",
+            item={"id": "grandmere", "name": "Grand-mère"},
+            reference_url=expired,
+            reference_local_path=str(tmp_path / "missing.png"),
+        )
 
 
 def test_reference_stage_prefers_user_selected_candidate_without_new_generation(tmp_path: Path):
@@ -294,11 +357,9 @@ def test_reference_stage_generates_explicit_multi_reference_combination(tmp_path
     combo = next(item for item in result["items"] if item["source_kind"] == "combination")
     assert combo["source_id"] == ["char_grandmere", "scene_foyer", "prop_mysterious_travel_bag"]
     assert len(posted) == 1
-    assert posted[0]["image"] == [
-        "https://files.example/grandmere.png",
-        "https://files.example/foyer.png",
-        "https://files.example/bag.png",
-    ]
+    assert "image" not in posted[0]
+    assert "char_grandmere" in posted[0]["prompt"]
+    assert combo["provenance"]["generation_mode"] == "text_to_image"
     assert "sequential_image_generation" not in posted[0]
 
 

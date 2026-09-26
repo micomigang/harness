@@ -145,9 +145,8 @@ def test_reference_regenerate_generates_only_missing_combination(tmp_path: Path)
     assert combos[0]["url"] == "/media/old-1.png"
     assert combos[1]["url"].endswith("/combination-combo__char_b__scene_b.png")
     assert len(posted) == 1
-    assert posted[0]["image"] == [
-        "https://files.example/char_b.png",
-        "https://files.example/scene_b.png",
-    ]
+    assert "image" not in posted[0]
+    assert "char_b" in posted[0]["prompt"]
+    assert combos[1]["provenance"]["generation_mode"] == "text_to_image"
     assert result["reference_validation"]["status"] == "pass"
     assert result["reference_plan"]["generation_calls_used"] == 1
