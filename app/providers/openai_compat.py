@@ -65,7 +65,14 @@ TASK_PROMPTS = {
     "dialogue_plan": "Return items aligned one-to-one with storyboard shots. Each item needs shot_index, speaker_id or null, text, language, timing, subtitle, lip_sync, and status. Use status silent for shots without speech.",
     "sound_plan": "Return items aligned one-to-one with storyboard shots. Each item needs shot_index, ambience, foley, cues, ducking, negative_audio, and status. Exclude spoken words and background-music composition.",
     "review": "Perform read-only QA. Return checks and blocking_failures. Every check needs name, status as pass/warn/fail, evidence, owner, and remediation. A fail must be listed in blocking_failures; do not silently repair inputs.",
-    "music_plan": "Return global_style, cues, ducking, render_mode, and status. Each cue needs start_shot, end_shot, mood, instrumentation, intensity, and dialogue_avoidance. Exclude Foley and dialogue.",
+    "music_plan": (
+        "Return exactly one COMPACT JSON object with global_style, cues, ducking, render_mode, and status. "
+        "No prose, no planning notes, no markdown, no chain-of-thought. Keep global_style concise (<= 500 characters). "
+        "Each cue needs cue_id, start_shot, end_shot, start_time, end_time, mood, instrumentation, intensity, and dialogue_avoidance. "
+        "Cover the complete approved storyboard timeline, including explicit silence/no-BGM cues where music must be absent. "
+        "Use the locked French dialogue timing and sound-plan constraints only for BGM ducking/avoidance; do not rewrite dialogue, Foley, ambience, shots, or assets. "
+        "Keep each cue concise and do not repeat upstream text verbatim. render_mode must state what is actually available and any fallback without claiming an unconfigured music API."
+    ),
 }
 
 
@@ -102,6 +109,7 @@ DIRECTOR_REVIEW_SYSTEM_PROMPT = (
     "For dialogue_plan reviews, generated_artifact.content.dialogue_validation is the deterministic harness authority for one-to-one storyboard-shot coverage, shot-index continuity and basic dialogue/silent structural completeness. The generated_artifact.content.items list supplied to you is the COMPLETE compact dialogue sequence; never infer that shots after item 10 are missing from a generic preview limit. If dialogue_validation.status=pass, do not recommend regeneration solely for an alleged missing tail shot_index or wrong item count. You may still flag genuine semantic issues such as wrong approved wording, speaker identity, delivery intent or timing when supported by the complete artifact."
     "For sound_plan reviews, generated_artifact.content.sound_validation is the deterministic harness authority for one-to-one storyboard-shot coverage and required sound-plan fields when present. The generated_artifact.content.items list supplied to you is the COMPLETE compact sound sequence; do not infer missing tail shots from a generic preview limit. If sound_validation.status=pass, do not recommend regeneration solely for an alleged item-count or tail-shot gap."
     "For review-stage self-review, generated_artifact.content.checks and blocking_failures are supplied as complete compact lists. Treat actual fail checks and blocking_failures as the gating evidence. Do not invent missing QA checks because a generic preview would normally cap lists. A review artifact may legitimately recommend adjust_next_stage when the QA report itself is structurally sound but identifies genuine upstream blockers."
+    "For compose reviews, generated_artifact.content.compose_validation is the deterministic Harness authority for source-shot order, local source availability, FFmpeg completion, ffprobe stream verification, final codec/aspect/audio normalization and duration tolerance. generated_artifact.content.input_shots is the canonical complete per-shot provenance array; input_shot_count is its numeric count. Literal filesystem source_path/local_path values are intentionally withheld from the external reviewer for privacy, while source_url/source_path_present/file metadata and actual_duration_seconds remain auditable. local_path_present=true plus output_file_size_bytes>0 and compose_validation.status=pass are sufficient evidence that the final master was persisted. For a requested 720p 9:16 output, 720x1280 is the correct portrait raster; 1080x1920 is 1080p and must not be required. If compose_validation.status=pass, do not recommend regeneration for allegedly missing local_path, input_shots, input_shot_indices, encoding, duration, FFmpeg return code, ffprobe streams, locked audio-profile normalization evidence, per-shot duration evidence, or a false 1080x1920 requirement."
 )
 
 SEGMENT_ANALYSIS_TASK = (
@@ -455,6 +463,74 @@ class OpenAICompatibleProvider(WorkflowProvider):
         return compact
 
     @classmethod
+    def _compact_batch_video_items(cls, value: Any) -> list[dict[str, Any]]:
+        """Return the complete batch-video shot set in a compact audit form.
+
+        Batch artifacts commonly contain more than the generic ten-item preview cap.
+        Truncating them makes the director reviewer falsely report missing tail shots
+        even when every provider job succeeded. Keep every shot row while retaining
+        only the execution/audit fields needed for acceptance review.
+        """
+        if not isinstance(value, list):
+            return []
+        compact: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            row = {
+                key: item.get(key)
+                for key in (
+                    "shot_index", "provider_job_id", "model", "status",
+                    "duration_seconds", "resolution", "ratio",
+                    "generate_audio", "reference_image_count",
+                    "reference_keys", "reused_from", "warning",
+                )
+                if key in item
+            }
+            digest = item.get("request_payload_digest")
+            if isinstance(digest, dict):
+                row["request_payload_digest"] = {
+                    key: digest.get(key)
+                    for key in (
+                        "shot_index", "model", "reference_keys",
+                        "upstream_revisions", "technical_params",
+                    )
+                    if key in digest
+                }
+            assembly = item.get("assembly_log")
+            if isinstance(assembly, dict):
+                compact_assembly: dict[str, Any] = {
+                    "status": assembly.get("status"),
+                    "upstream_revisions": assembly.get("upstream_revisions"),
+                }
+                for key in ("storyboard", "dialogue_plan", "sound_plan"):
+                    if isinstance(assembly.get(key), dict):
+                        compact_assembly[key] = assembly.get(key)
+                row["assembly_log"] = compact_assembly
+            preflight = item.get("preflight_checks")
+            if isinstance(preflight, dict):
+                row["preflight_checks"] = {
+                    "status": preflight.get("status"),
+                    "reference_resolver": preflight.get("reference_resolver"),
+                    "trusted_provenance_tos": preflight.get("trusted_provenance_tos"),
+                    "technical_params": preflight.get("technical_params"),
+                }
+            probe = item.get("audio_probe")
+            if isinstance(probe, dict):
+                row["audio_probe"] = {
+                    key: probe.get(key)
+                    for key in (
+                        "status", "has_audio", "stream_count", "codec",
+                        "channels", "sample_rate",
+                    )
+                    if key in probe
+                }
+            if "provider_generate_audio_echo" in item:
+                row["provider_generate_audio_echo"] = item.get("provider_generate_audio_echo")
+            compact.append(row)
+        return compact
+
+    @classmethod
     def _compact_asset_requirements(cls, value: Any) -> list[dict[str, Any]]:
         if not isinstance(value, list):
             return []
@@ -492,7 +568,7 @@ class OpenAICompatibleProvider(WorkflowProvider):
             "continuity_rules", "adaptation_notes", "open_questions",
             "source_fact_register", "adaptation_decisions", "asset_requirements",
             "items", "manifest_validation", "shots", "checks", "blocking_failures", "status", "note",
-            "estimated_seconds", "storyboard_validation", "dialogue_validation", "sound_validation", "shot_index", "provider_job_id", "model", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed"
+            "estimated_seconds", "storyboard_validation", "dialogue_validation", "sound_validation", "shot_index", "provider_job_id", "model", "url", "selection_coverage", "reference_plan", "reference_validation", "missing_isolated", "missing_combinations", "requested", "completed", "storyboard_shots", "submitted_new_tasks", "reused_existing", "batch_concurrency", "execution_mode", "fail_stop_scope", "coverage_complete", "batch_validation", "input_shots", "input_shot_count", "input_shot_indices", "expected_shot_indices", "input_sources", "requested_resolution", "requested_ratio", "audio_profile_lock", "music_mode", "encoding", "duration_seconds", "expected_duration_seconds", "duration_delta_seconds", "ffmpeg", "probe", "audio_normalization", "compose_validation", "local_path_present", "output_file_size_bytes"
         ):
             if key not in content:
                 continue
@@ -507,8 +583,31 @@ class OpenAICompatibleProvider(WorkflowProvider):
                 value = cls._compact_dialogue_items(value)
             elif key == "items" and kind == "sound_plan":
                 value = cls._compact_sound_items(value)
+            elif key == "items" and kind == "batch_video":
+                value = cls._compact_batch_video_items(value)
             elif key == "checks" and kind == "review":
                 value = cls._compact_review_checks(value)
+            elif kind == "compose" and key in {"input_shot_indices", "expected_shot_indices"}:
+                value = list(value) if isinstance(value, list) else value
+            elif kind == "compose" and key in {"input_shots", "input_sources"}:
+                # Compose input provenance must remain complete for every current
+                # storyboard shot. Literal filesystem paths are intentionally hidden
+                # from the external reviewer, but source URL/presence, actual duration
+                # and per-shot comparison evidence remain visible.
+                value = [
+                    {
+                        field: item.get(field)
+                        for field in (
+                            "shot_index", "source_url", "url", "source_path_present",
+                            "local_path_present", "file_name", "file_size_bytes",
+                            "actual_duration_seconds", "expected_duration_seconds",
+                            "duration_delta_seconds", "reused_from",
+                        )
+                        if field in item
+                    }
+                    for item in value
+                    if isinstance(item, dict)
+                ] if isinstance(value, list) else value
             elif key == "blocking_failures" and kind == "review":
                 value = list(value) if isinstance(value, list) else value
             elif key == "asset_requirements":
@@ -1120,6 +1219,38 @@ class OpenAICompatibleProvider(WorkflowProvider):
             stage=stage,
         )
 
+    def _repair_json_output(self, *, stage: str, malformed_content: Any) -> dict[str, Any]:
+        """One compact schema-repair pass for a malformed model response.
+
+        This is intentionally a formatting recovery, not a creative regeneration:
+        it receives only the model's own failed output and must preserve its
+        substantive decisions while returning one valid JSON object.
+        """
+        if isinstance(malformed_content, str):
+            raw = malformed_content
+        else:
+            raw = json.dumps(malformed_content, ensure_ascii=False)
+        raw = raw[:40000]
+        repair_task = (
+            "Repair the following malformed model output into exactly one valid JSON object for stage "
+            f"{stage}. Preserve the substantive plan already present; do not invent new story, shots, dialogue, assets or timings. "
+            "Remove planning notes, self-talk, markdown and duplicate drafts. Return JSON only."
+        )
+        payload = self._build_payload(
+            task=repair_task,
+            user_content=raw,
+            stage=stage,
+        )
+        response_data, _ = self._post_json(payload)
+        choice = response_data["choices"][0]
+        repaired = self._parse_json_object(choice["message"]["content"])
+        repaired["_parse_recovery"] = {
+            "used": True,
+            "mode": "json_schema_repair",
+            "source_stage": stage,
+        }
+        return repaired
+
     def _request_json(
         self,
         *,
@@ -1141,6 +1272,16 @@ class OpenAICompatibleProvider(WorkflowProvider):
                 )
             except Exception:
                 pass
+            # Kimi occasionally returns a substantively complete plan mixed with
+            # self-talk / a duplicate draft even while JSON mode is requested.
+            # For planning stages, make one small repair-only call before failing.
+            # The repair sees only the already-generated response, so it cannot
+            # redesign upstream production truth or trigger any media provider.
+            if stage in {"music_plan"}:
+                try:
+                    return self._repair_json_output(stage=stage, malformed_content=content)
+                except Exception:
+                    pass
             preview = self._response_preview(response_data if response_data else response_text)
             hint = (
                 " The model stopped because the output-length limit was reached; reduce requested output or raise the model output limit."
@@ -1332,6 +1473,102 @@ class OpenAICompatibleProvider(WorkflowProvider):
         return value
 
     @classmethod
+    def _prepare_music_plan_prompt_context(cls, cleaned: dict[str, Any]) -> dict[str, Any]:
+        """Build a small, production-authoritative context for the music director.
+
+        The music stage previously inherited every asset candidate, reference URL,
+        Seedance audit record and long-form upstream artifact. On a 14-shot episode
+        that pushed Kimi past 200k prompt tokens and materially increased the chance
+        of malformed JSON. Music planning only needs the locked narrative beats,
+        shot timing, dialogue windows, sound constraints and successful batch-shot
+        timing. Keep all rows dynamically; only drop fields irrelevant to BGM.
+        """
+        result: dict[str, Any] = {}
+        for key in (
+            "workspace", "brief", "project_memory", "user_instruction",
+            "execution_directive", "approvals", "series",
+        ):
+            if key in cleaned:
+                result[key] = cleaned.get(key)
+
+        artifacts: list[dict[str, Any]] = []
+        for artifact in cleaned.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            kind = str(artifact.get("kind") or "")
+            content = artifact.get("content") if isinstance(artifact.get("content"), dict) else {}
+            compact: dict[str, Any] | None = None
+            if kind == "script":
+                compact = {
+                    key: content.get(key)
+                    for key in (
+                        "title", "language", "target_market", "localization_strategy",
+                        "beats", "continuity_rules", "adaptation_notes",
+                    )
+                    if key in content
+                }
+                if isinstance(compact.get("adaptation_notes"), str):
+                    compact["adaptation_notes"] = compact["adaptation_notes"][:2400]
+            elif kind == "storyboard":
+                shots = []
+                for shot in content.get("shots", []) if isinstance(content.get("shots"), list) else []:
+                    if not isinstance(shot, dict):
+                        continue
+                    shots.append({
+                        key: shot.get(key)
+                        for key in ("index", "duration_seconds", "story_beat", "scene", "status")
+                        if key in shot
+                    })
+                compact = {
+                    "shots": shots,
+                    "estimated_seconds": content.get("estimated_seconds"),
+                    "storyboard_validation": content.get("storyboard_validation"),
+                }
+            elif kind == "dialogue_plan":
+                compact = {
+                    "items": cls._compact_dialogue_items(content.get("items")),
+                    "dialogue_validation": content.get("dialogue_validation"),
+                }
+            elif kind == "sound_plan":
+                compact = {
+                    "items": cls._compact_sound_items(content.get("items")),
+                    "sound_validation": content.get("sound_validation"),
+                }
+            elif kind == "batch_video":
+                rows = []
+                for item in content.get("items", []) if isinstance(content.get("items"), list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    rows.append({
+                        key: item.get(key)
+                        for key in ("shot_index", "duration_seconds", "status", "reused_from")
+                        if key in item
+                    })
+                compact = {
+                    "items": rows,
+                    "requested": content.get("requested"),
+                    "completed": content.get("completed"),
+                    "storyboard_shots": content.get("storyboard_shots"),
+                    "coverage_complete": content.get("coverage_complete"),
+                    "status": content.get("status"),
+                }
+            elif kind == "review":
+                compact = {
+                    "status": content.get("status"),
+                    "blocking_failures": list(content.get("blocking_failures") or []),
+                }
+            if compact is None:
+                continue
+            artifacts.append({
+                "kind": kind,
+                "status": artifact.get("status"),
+                "revision": artifact.get("revision"),
+                "content": compact,
+            })
+        result["artifacts"] = artifacts
+        return result
+
+    @classmethod
     def _prepare_prompt_context(cls, stage: str, context: dict[str, Any]) -> dict[str, Any]:
         """Strip runtime/heavy evidence that downstream agents do not need.
 
@@ -1341,6 +1578,8 @@ class OpenAICompatibleProvider(WorkflowProvider):
         cleaned = cls._sanitize_for_external(context)
         if not isinstance(cleaned, dict):
             return {}
+        if stage == "music_plan":
+            return cls._prepare_music_plan_prompt_context(cleaned)
         artifacts = []
         for artifact in cleaned.get("artifacts", []):
             if not isinstance(artifact, dict):

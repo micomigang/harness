@@ -492,3 +492,235 @@ def test_storyboard_review_guard_does_not_require_downstream_qa_closure():
     assert guarded["recommended_action"] == "proceed"
     assert guarded["deviations"] == []
     assert guarded["harness_review_guard"]["suppressed_structural_deviations"]
+
+
+def test_batch_video_validation_and_review_guard_suppress_ten_item_preview_false_negative():
+    artifact = {
+        "kind": "batch_video",
+        "revision": 2,
+        "content": {
+            "items": [
+                {"shot_index": index, "status": "succeeded", "provider_job_id": f"task-{index}", "url": f"/shot-{index}.mp4"}
+                for index in range(1, 15)
+            ],
+            "requested": 14,
+            "completed": 14,
+            "storyboard_shots": 14,
+            "coverage_complete": True,
+        },
+    }
+    storyboard = {"content": {"shots": [{"index": index} for index in range(1, 15)]}}
+    sound = {"content": {"items": [
+        {"shot_index": index, "ducking": {"active": False if index in {9, 14} else True}, "negative_audio": ["no music"]}
+        for index in range(1, 15)
+    ]}}
+    validation = Orchestrator._batch_video_validation(artifact, storyboard, sound)
+    assert validation["status"] == "pass"
+    assert validation["actual_items"] == 14
+    assert validation["missing_shots"] == []
+    assert validation["sound_source_checks"]["14"]["ducking_active"] is False
+
+    reviewed_artifact = {**artifact, "content": {**artifact["content"], "batch_validation": validation}}
+    review = {
+        "assessment": "incomplete",
+        "recommended_action": "regenerate_current",
+        "deviations": [
+            "Shots 11–14 在 generated_artifact.content.items 中完全缺失，artifact 却声明 completed=14",
+            "Shot 09 的 compact assembly_log 未显式暴露 ducking.active=false",
+            "Shot 14 缺失导致无法验证其 negative_audio 禁令是否落实",
+        ],
+        "suggested_adjustments": ["补提交缺失的 Shots 11–14"],
+    }
+    guarded = Orchestrator._guard_batch_video_review(review, reviewed_artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["assessment"] == "pass"
+    assert guarded["deviations"] == []
+    assert guarded["harness_review_guard"]["actual_items"] == 14
+
+
+def test_batch_video_validation_and_review_guard_use_dynamic_storyboard_count():
+    """Batch coverage authority is the current storyboard, never a hard-coded 14."""
+    shot_count = 6
+    artifact = {
+        "kind": "batch_video",
+        "revision": 3,
+        "content": {
+            "items": [
+                {"shot_index": index, "status": "succeeded", "provider_job_id": f"task-{index}", "url": f"/shot-{index}.mp4"}
+                for index in range(1, shot_count + 1)
+            ],
+            "requested": shot_count,
+            "completed": shot_count,
+            "storyboard_shots": shot_count,
+            "coverage_complete": True,
+        },
+    }
+    storyboard = {"content": {"shots": [{"index": index} for index in range(1, shot_count + 1)]}}
+    sound = {"content": {"items": [
+        {"shot_index": index, "ducking": {"active": index != 6}, "negative_audio": ["no music"]}
+        for index in range(1, shot_count + 1)
+    ]}}
+    validation = Orchestrator._batch_video_validation(artifact, storyboard, sound)
+    assert validation["status"] == "pass"
+    assert validation["expected_items"] == shot_count
+    assert validation["expected_shot_indices"] == list(range(1, shot_count + 1))
+
+    reviewed_artifact = {**artifact, "content": {**artifact["content"], "batch_validation": validation}}
+    review = {
+        "assessment": "incomplete",
+        "recommended_action": "regenerate_current",
+        "deviations": [
+            "Shots 5–6 在 generated_artifact.content.items 中缺失，artifact 却声明 completed=6",
+            "Shot 6 的 compact assembly_log 未显式暴露 ducking.active=false",
+            "Shot 6 缺失导致无法验证其 negative_audio 禁令是否落实",
+        ],
+        "suggested_adjustments": ["补提交缺失的 Shots 5–6"],
+    }
+    guarded = Orchestrator._guard_batch_video_review(review, reviewed_artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["assessment"] == "pass"
+    assert guarded["deviations"] == []
+    assert guarded["harness_review_guard"]["expected_items"] == shot_count
+
+
+def test_music_plan_validation_uses_current_storyboard_shot_count_not_fixed_count():
+    content = {
+        "global_style": "French chamber score",
+        "cues": [
+            {"cue_id": "A", "start_shot": 1, "end_shot": 2, "start_time": 0, "end_time": 10, "mood": "warm", "instrumentation": "piano", "intensity": "low", "dialogue_avoidance": {"active": True}},
+            {"cue_id": "B", "start_shot": 3, "end_shot": 3, "start_time": 10, "end_time": 15, "mood": "silence", "instrumentation": "silence", "intensity": 0, "dialogue_avoidance": {"active": False}},
+        ],
+        "ducking": "-8dB",
+        "render_mode": "assembly-external",
+        "status": "ready",
+    }
+    storyboard = {"shots": [
+        {"index": 1, "duration_seconds": 5},
+        {"index": 2, "duration_seconds": 5},
+        {"index": 3, "duration_seconds": 5},
+    ]}
+    normalized = Orchestrator._normalize_music_plan(content, storyboard_content=storyboard, dialogue_content={"items": []})
+    validation = normalized["music_plan_validation"]
+    assert validation["status"] == "pass"
+    assert validation["expected_shot_count"] == 3
+    assert validation["covered_shots"] == [1, 2, 3]
+    assert validation["total_duration_seconds"] == 15.0
+
+
+def test_skip_music_creates_auditable_ready_placeholder_and_unlocks_compose(tmp_path: Path):
+    db, orchestrator, workspace_id = build(tmp_path)
+    orchestrator.run(workspace_id, "analysis")
+    orchestrator.run(workspace_id, "script")
+    db.set_approval(workspace_id, "script_approved", "approved")
+    orchestrator.run(workspace_id, "asset_manifest")
+    for stage in ["characters", "scenes", "props", "reference_images"]:
+        orchestrator.run(workspace_id, stage)
+    db.set_approval(workspace_id, "assets_approved", "approved")
+    for stage in ["storyboard", "dialogue_plan", "sound_plan", "review"]:
+        orchestrator.run(workspace_id, stage)
+    db.set_approval(workspace_id, "storyboard_approved", "approved")
+    orchestrator.run(workspace_id, "preview")
+    db.set_approval(workspace_id, "preview_approved", "approved")
+    orchestrator.run(workspace_id, "batch_video")
+
+    result = orchestrator.skip_music(workspace_id)
+    music = db.get_artifact(workspace_id, "music")
+    assert result["media_generated"] is False
+    assert result["next_stage"] == "compose"
+    assert music and music["status"] == "ready"
+    assert music["content"]["mode"] == "skipped_no_bgm"
+    assert music["content"]["skipped"] is True
+    assert music["content"]["_execution"]["music_api_called"] is False
+
+    action = orchestrator.next_actions(workspace_id)[0]
+    assert action["type"] == "run"
+    assert action["stage"] == "compose"
+
+
+def test_skipped_music_bypasses_missing_music_plan_but_not_incomplete_batch(tmp_path: Path):
+    db, orchestrator, workspace_id = build(tmp_path)
+    orchestrator.run(workspace_id, "analysis")
+    orchestrator.run(workspace_id, "script")
+    db.set_approval(workspace_id, "script_approved", "approved")
+    orchestrator.run(workspace_id, "asset_manifest")
+    for stage in ["characters", "scenes", "props", "reference_images"]:
+        orchestrator.run(workspace_id, stage)
+    db.set_approval(workspace_id, "assets_approved", "approved")
+    for stage in ["storyboard", "dialogue_plan", "sound_plan", "review"]:
+        orchestrator.run(workspace_id, stage)
+    db.set_approval(workspace_id, "storyboard_approved", "approved")
+    orchestrator.run(workspace_id, "preview")
+    db.set_approval(workspace_id, "preview_approved", "approved")
+    orchestrator.run(workspace_id, "batch_video")
+
+    # There is deliberately no music_plan artifact here. Explicit skip still
+    # opens compose because the user deferred the optional music branch.
+    orchestrator.skip_music(workspace_id)
+    assert db.get_artifact(workspace_id, "music_plan") is None
+    assert orchestrator.next_actions(workspace_id)[0]["stage"] == "compose"
+
+    # If the complete batch becomes stale, a new skip is refused.
+    batch = db.get_artifact(workspace_id, "batch_video")
+    db.mark_artifacts_stale(workspace_id, ["batch_video"])
+    try:
+        orchestrator.skip_music(workspace_id)
+    except OrchestrationError as exc:
+        assert "批量视频尚未完整 ready" in str(exc)
+    else:
+        raise AssertionError("skip music must not bypass incomplete/stale batch video")
+
+
+def test_compose_review_guard_suppresses_false_missing_audit_fields():
+    artifact = {
+        "content": {
+            "compose_validation": {
+                "status": "pass",
+                "structural_authority": "harness+ffmpeg+ffprobe",
+                "checks": {"ffmpeg_returncode_zero": True, "audio_sample_rate_32000": True},
+            }
+        }
+    }
+    review = {
+        "assessment": "incomplete",
+        "recommended_action": "regenerate_current",
+        "reply": "missing audit fields",
+        "deviations": [
+            "缺少 local_path / input_shots / encoding，无法验证 FFmpeg 返回码与 ffprobe streams",
+            "未显式记录 Shot 10 重采样为 32 kHz stereo",
+            "input_shot_indices 仅展示 1-10，与实际镜头数不匹配",
+            "视频分辨率为 720x1280，非 1080x1920，不符合 9:16 要求",
+            "duration_within_tolerance 未通过",
+        ],
+        "suggested_adjustments": ["补齐 ffprobe 与重采样审计字段"],
+    }
+    guarded = Orchestrator._guard_compose_review(review, artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["assessment"] == "pass"
+    assert guarded["deviations"] == []
+    assert guarded["harness_review_guard"]["compose_validation_status"] == "pass"
+
+
+def test_compose_review_guard_handles_object_deviation_payloads():
+    artifact = {
+        "content": {
+            "compose_validation": {
+                "status": "pass",
+                "structural_authority": "harness+ffmpeg+ffprobe",
+                "checks": {"input_shots_schema": True, "ffmpeg_returncode_zero": True},
+            }
+        }
+    }
+    review = {
+        "assessment": "partial_failure",
+        "recommended_action": "regenerate_current",
+        "deviations": {
+            "issue": "input_shots 缺少逐镜结构，无法验证 duration_seconds"
+        },
+        "suggested_adjustments": {
+            "message": "补齐 input_shots"
+        },
+    }
+    guarded = Orchestrator._guard_compose_review(review, artifact)
+    assert guarded["recommended_action"] == "proceed"
+    assert guarded["assessment"] == "pass"
+    assert guarded["deviations"] == []

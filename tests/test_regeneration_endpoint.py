@@ -79,3 +79,31 @@ def test_regeneration_endpoint_prepares_feedback_and_enqueues_job(monkeypatch):
     assert result["director_reply"] == "已理解并准备重新生成"
     assert result["memory_preserved"] is True
     assert len(background.tasks) == 1
+
+
+def test_preview_wait_for_user_allows_normal_human_approval(monkeypatch):
+    class ApprovalDB:
+        def get_workspace(self, workspace_id):
+            return {"id": workspace_id}
+
+        def get_artifact(self, workspace_id, stage):
+            assert stage == "preview"
+            return {"kind": "preview", "revision": 3, "content": {"status": "succeeded"}}
+
+        def get_stage_review(self, workspace_id, stage):
+            assert stage == "preview"
+            return {
+                "artifact_revision": 3,
+                "review": {"recommended_action": "wait_for_user"},
+            }
+
+        def set_approval(self, workspace_id, gate, status, note):
+            return {"gate": gate, "status": status, "note": note}
+
+    monkeypatch.setattr(main_module, "db", ApprovalDB())
+    result = main_module.update_approval(
+        "ws-1",
+        "preview_approved",
+        main_module.ApprovalUpdate(status="approved", note="人工审看通过"),
+    )
+    assert result["status"] == "approved"

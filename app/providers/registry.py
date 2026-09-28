@@ -98,10 +98,12 @@ class ProviderRegistry:
                     poll_interval_seconds=settings.video_poll_interval_seconds,
                     poll_timeout_seconds=settings.video_poll_timeout_seconds,
                     batch_max_shots=settings.video_batch_max_shots,
+                    batch_concurrency=settings.video_batch_concurrency,
                     output_dir=settings.data_dir / "outputs",
                     account_id=settings.ark_account_id,
                     original_archive=original_archive,
                     preflight_enabled=True,
+                    ffmpeg_path=settings.ffmpeg_path,
                 ),
                 media=LocalMediaProvider(
                     ffmpeg_path=settings.ffmpeg_path,

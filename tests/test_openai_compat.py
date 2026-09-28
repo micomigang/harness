@@ -658,3 +658,144 @@ def test_preview_review_context_includes_tracking_fields():
         {"kind": "preview", "status": "ready", "revision": 1, "content": content}
     )
     assert all(preview["content"][key] == value for key, value in content.items())
+
+
+def test_batch_video_preview_keeps_complete_compact_shot_sequence():
+    items = []
+    for index in range(1, 15):
+        items.append({
+            "shot_index": index,
+            "provider_job_id": f"task-{index}",
+            "model": "doubao-seedance-2-0-260128",
+            "status": "succeeded",
+            "duration_seconds": 10,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "generate_audio": True,
+            "reference_keys": ["char_a", "scene_a"],
+            "request_payload_digest": {
+                "shot_index": index,
+                "upstream_revisions": {"storyboard": 6, "sound_plan": 3},
+                "technical_params": {"resolution": "720p", "ratio": "9:16", "generate_audio": True},
+            },
+            "assembly_log": {
+                "status": "pass",
+                "sound_plan": {"hydrated": True, "ducking_active": False if index in {9, 14} else True},
+            },
+            "preflight_checks": {"status": "pass"},
+            "audio_probe": {"status": "pass", "has_audio": True, "codec": "aac"},
+        })
+    preview = OpenAICompatibleProvider._director_artifact_preview({
+        "kind": "batch_video",
+        "revision": 2,
+        "status": "ready",
+        "provider": "kimi-seedance",
+        "content": {
+            "items": items,
+            "requested": 14,
+            "completed": 14,
+            "storyboard_shots": 14,
+            "coverage_complete": True,
+            "submitted_new_tasks": 6,
+            "reused_existing": 8,
+            "batch_concurrency": 3,
+            "execution_mode": "parallel_waves",
+            "fail_stop_scope": "wave",
+        },
+    })
+    assert len(preview["content"]["items"]) == 14
+    assert preview["content"]["items"][-1]["shot_index"] == 14
+    assert preview["content"]["items"][-1]["assembly_log"]["sound_plan"]["ducking_active"] is False
+    assert preview["content"]["coverage_complete"] is True
+    assert preview["content"]["submitted_new_tasks"] == 6
+
+
+def test_music_plan_context_keeps_dynamic_shot_rows_but_drops_heavy_visual_assets():
+    context = {
+        "workspace": {"id": "w", "title": "Episode", "settings": {"target_market": "France"}},
+        "project_memory": "keep continuity",
+        "user_instruction": "plan music only",
+        "execution_directive": {"interpretation": "locked upstream"},
+        "artifacts": [
+            {"kind": "characters", "revision": 4, "status": "ready", "content": {"items": [{"canonical_key": "char_a", "huge": "x" * 10000}]}},
+            {"kind": "script", "revision": 1, "status": "ready", "content": {"title": "EP", "language": "fr", "target_market": "France", "beats": ["a", "b"]}},
+            {"kind": "storyboard", "revision": 6, "status": "ready", "content": {"shots": [
+                {"index": 1, "duration_seconds": 5, "story_beat": "a", "visual_prompt": "x" * 5000},
+                {"index": 2, "duration_seconds": 7, "story_beat": "b", "visual_prompt": "y" * 5000},
+            ], "estimated_seconds": 12}},
+            {"kind": "dialogue_plan", "revision": 2, "status": "ready", "content": {"items": [
+                {"shot_index": 1, "text": "Bonjour", "timing": {"relative_start": 0.5, "relative_end": 2.0}, "status": "dialogue"},
+                {"shot_index": 2, "status": "silent", "no_dialogue": True},
+            ]}},
+            {"kind": "sound_plan", "revision": 3, "status": "ready", "content": {"items": [
+                {"shot_index": 1, "ambience": "room", "foley": [], "cues": [], "ducking": {"active": True}, "negative_audio": [], "status": "dialogue"},
+                {"shot_index": 2, "ambience": "room", "foley": [], "cues": [], "ducking": {"active": False}, "negative_audio": ["no bgm"], "status": "silent"},
+            ]}},
+            {"kind": "batch_video", "revision": 2, "status": "ready", "content": {"items": [
+                {"shot_index": 1, "duration_seconds": 5, "status": "succeeded", "url": "https://example/1.mp4", "assembly_log": {"huge": "z" * 10000}},
+                {"shot_index": 2, "duration_seconds": 7, "status": "succeeded", "url": "https://example/2.mp4"},
+            ], "requested": 2, "completed": 2, "coverage_complete": True}},
+        ],
+    }
+    compact = OpenAICompatibleProvider._prepare_prompt_context("music_plan", context)
+    kinds = [item["kind"] for item in compact["artifacts"]]
+    assert kinds == ["script", "storyboard", "dialogue_plan", "sound_plan", "batch_video"]
+    storyboard = next(item for item in compact["artifacts"] if item["kind"] == "storyboard")
+    assert len(storyboard["content"]["shots"]) == 2
+    assert "visual_prompt" not in storyboard["content"]["shots"][0]
+    batch = next(item for item in compact["artifacts"] if item["kind"] == "batch_video")
+    assert batch["content"]["items"] == [
+        {"shot_index": 1, "duration_seconds": 5, "status": "succeeded"},
+        {"shot_index": 2, "duration_seconds": 7, "status": "succeeded"},
+    ]
+
+
+def test_compose_director_preview_exposes_audit_not_private_local_path():
+    preview = OpenAICompatibleProvider._director_artifact_preview({
+        "kind": "compose",
+        "status": "ready",
+        "revision": 2,
+        "provider": "local-ffmpeg",
+        "content": {
+            "url": "/media/w/compose/final.mp4",
+            "local_path": "F:/private/final.mp4",
+            "local_path_present": True,
+            "output_file_size_bytes": 1234,
+            "input_shots": [
+                {"shot_index": i, "source_url": f"/media/w/batch/shot-{i:03d}.mp4", "source_path": f"F:/private/shot-{i:03d}.mp4", "source_path_present": True, "file_name": f"shot-{i:03d}.mp4", "file_size_bytes": 1000, "actual_duration_seconds": 10.001, "expected_duration_seconds": 10.0, "duration_delta_seconds": 0.001}
+                for i in range(1, 15)
+            ],
+            "input_shot_count": 14,
+            "input_shot_indices": list(range(1, 15)),
+            "expected_shot_indices": list(range(1, 15)),
+            "input_sources": [
+                {"shot_index": i, "source_url": f"/media/w/batch/shot-{i:03d}.mp4", "source_path": f"F:/private/shot-{i:03d}.mp4", "source_path_present": True, "file_name": f"shot-{i:03d}.mp4", "file_size_bytes": 1000, "actual_duration_seconds": 10.001}
+                for i in range(1, 15)
+            ],
+            "requested_resolution": "720p",
+            "requested_ratio": "9:16",
+            "duration_seconds": 158.0,
+            "expected_duration_seconds": 158.0,
+            "encoding": {"video": "H.264 / CRF 20", "audio": "AAC / 192k / 32 kHz / stereo"},
+            "ffmpeg": {"returncode": 0},
+            "probe": {"returncode": 0, "audio_stream": {"codec_name": "aac", "sample_rate": 32000, "channels": 2}},
+            "audio_normalization": {"target_sample_rate_hz": 32000, "target_channels": 2, "resampled_shots": [10]},
+            "compose_validation": {"status": "pass", "checks": {"ffmpeg_returncode_zero": True}},
+            "status": "succeeded",
+        },
+    })
+    content = preview["content"]
+    assert content["input_shot_count"] == 14
+    assert len(content["input_shots"]) == 14
+    assert content["input_shots"][-1]["shot_index"] == 14
+    assert content["input_shots"][-1]["actual_duration_seconds"] == 10.001
+    assert all("source_path" not in item for item in content["input_shots"])
+    assert content["input_shot_indices"] == list(range(1, 15))
+    assert content["expected_shot_indices"] == list(range(1, 15))
+    assert len(content["input_sources"]) == 14
+    assert all("local_path" not in item and "source_path" not in item for item in content["input_sources"])
+    assert content["requested_resolution"] == "720p"
+    assert content["requested_ratio"] == "9:16"
+    assert content["compose_validation"]["status"] == "pass"
+    assert content["local_path_present"] is True
+    assert "local_path" not in content

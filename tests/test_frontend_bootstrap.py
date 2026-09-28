@@ -16,8 +16,8 @@ def test_upload_uses_native_label_file_picker():
 
 def test_frontend_assets_are_versioned_to_avoid_mixed_cache():
     html = (_root() / "static" / "index.html").read_text(encoding="utf-8")
-    assert '/static/app.js?v=20260927-v13-image-provenance' in html
-    assert '/static/style.css?v=20260927-v13-image-provenance' in html
+    assert '/static/app.js?v=20260928-v23-dynamic-audio-lock' in html
+    assert '/static/style.css?v=20260928-v23-dynamic-audio-lock' in html
 
 
 def test_workspace_bootstrap_is_not_blocked_by_health_or_meta_failure():
@@ -80,3 +80,38 @@ def test_visual_asset_workbench_uses_long_canvas_and_shows_director_review_state
     assert 'max-height: none' in css
     assert '.artifact-card.asset-workbench-card .candidate-editor textarea' in css
     assert 'min-height: 118px' in css
+
+
+def test_music_and_compose_use_dedicated_full_width_workbenches():
+    js = (_root() / "static" / "app.js").read_text(encoding="utf-8")
+    css = (_root() / "static" / "style.css").read_text(encoding="utf-8")
+    assert "function renderMusicPlan(content)" in js
+    assert "function renderMusicRender(content)" in js
+    assert "function renderCompose(content)" in js
+    assert 'a.kind === "music_plan"' in js
+    assert 'a.kind === "compose"' in js
+    assert ".artifact-card.music-plan-workbench-card" in css
+    assert ".artifact-card.compose-workbench-card" in css
+    assert "grid-column: 1 / -1" in css
+
+
+def test_music_can_be_explicitly_skipped_without_provider_call():
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'id="skipMusicBtn"' in html
+    assert '/music/skip' in js
+    assert 'skipMusicAndContinue' in js
+    assert 'skipped_no_bgm' in js
+
+
+def test_music_stages_are_directly_navigable_and_skip_is_visible_in_music_tab():
+    root = Path(__file__).resolve().parents[1]
+    js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    assert '["music_plan", "全片配乐方案"]' in js
+    assert '["music", "音乐"]' in js
+    assert '["compose", "最终合成"]' in js
+    assert 'data-stage-nav' in js
+    assert 'function renderMissingStageWorkbench(stage, artifacts)' in js
+    assert 'data-skip-music-inline' in js
+    assert '跳过音乐，直接进入合成' in js

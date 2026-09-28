@@ -56,6 +56,7 @@ class Settings:
     video_poll_interval_seconds: float
     video_poll_timeout_seconds: int
     video_batch_max_shots: int
+    video_batch_concurrency: int
     ffmpeg_path: str
     tts_app_id: str
     tts_access_token: str
@@ -135,6 +136,7 @@ class Settings:
                 os.getenv("VIDEO_POLL_TIMEOUT_SECONDS", "900")
             ),
             video_batch_max_shots=int(os.getenv("VIDEO_BATCH_MAX_SHOTS", "8")),
+            video_batch_concurrency=int(os.getenv("VIDEO_BATCH_CONCURRENCY", "3")),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
             tts_app_id=os.getenv("TTS_APP_ID", ""),
             tts_access_token=os.getenv("TTS_ACCESS_TOKEN", ""),

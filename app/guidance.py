@@ -31,6 +31,8 @@ DIRECTOR_PARAMETER_RULES: dict[str, dict[str, str]] = {
     "compose": {
         "video_crf": "integer 16-28; lower means higher H.264 quality",
         "audio_bitrate_kbps": "integer 96-320",
+        "audio_sample_rate_hz": "integer 8000-192000; optional explicit compose audio-profile override",
+        "audio_channels": "integer 1-2; optional explicit compose audio-profile override",
     },
 }
 
@@ -62,6 +64,8 @@ _PARAMETER_CUES: dict[str, dict[str, tuple[str, ...]]] = {
     "compose": {
         "video_crf": ("crf", "压缩", "画质", "码率"),
         "audio_bitrate_kbps": ("音频码率", "kbps", "bitrate"),
+        "audio_sample_rate_hz": ("采样率", "sample rate", "hz", "khz"),
+        "audio_channels": ("声道", "channels", "mono", "stereo", "单声道", "立体声"),
     },
 }
 
@@ -97,6 +101,8 @@ def _explicit_parameter_authorization(stage: str, key: str, user_instruction: st
         "shot_index",
         "video_crf",
         "audio_bitrate_kbps",
+        "audio_sample_rate_hz",
+        "audio_channels",
     }:
         return bool(re.search(r"\d", text))
     return True
@@ -158,6 +164,12 @@ def sanitize_parameter_overrides(
                 result[key] = max(16, min(28, int(raw)))
             elif stage == "compose" and key == "audio_bitrate_kbps":
                 result[key] = max(96, min(320, int(raw)))
+            elif stage == "compose" and key == "audio_sample_rate_hz":
+                result[key] = max(8000, min(192000, int(raw)))
+            elif stage == "compose" and key == "audio_channels":
+                channels = int(raw)
+                if channels in {1, 2}:
+                    result[key] = channels
         except (TypeError, ValueError):
             continue
     return result

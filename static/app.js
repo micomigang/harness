@@ -17,6 +17,7 @@ const state = {
   candidateBases: {},
   batchSelections: {},
   visualAssetDetail: null,
+  batchVideoDetailShot: null,
   candidateRequestStatus: {},
 };
 
@@ -190,15 +191,25 @@ function renderStageRail(artifacts) {
     const artifact = byKind[stage];
     const status = artifact?.status || "missing";
     const agent = agents[state.meta.stage_agents?.[stage]];
-    return `<div class="stage-step ${status}" title="${escapeHtml(agent?.name || "未分配")} · ${status}">${escapeHtml(state.meta.labels[stage])}</div>`;
+    return `<button class="stage-step ${status}" data-stage-nav="${escapeHtml(stage)}" title="${escapeHtml(agent?.name || "未分配")} · ${status}">${escapeHtml(state.meta.labels[stage])}</button>`;
   }).join("");
+  $("#stageRail").querySelectorAll("[data-stage-nav]").forEach(el => {
+    el.addEventListener("click", () => {
+      const stage = el.dataset.stageNav || "";
+      const groupedPlans = new Set(["dialogue_plan", "sound_plan", "review"]);
+      const groupedMedia = new Set(["preview", "batch_video"]);
+      state.tab = groupedPlans.has(stage) ? "plans" : (groupedMedia.has(stage) ? "media" : stage);
+      renderDetail();
+    });
+  });
 }
 
 function renderTabs() {
   const tabs = [
     ["flow", "制作对话流"], ["overview", "总览"], ["asset_library", "主题资产库"], ["agents", "Agent 职责"], ["source", "素材"], ["analysis", "素材分析"], ["script", "剧本"], ["asset_manifest", "资产解析"], ["characters", "角色"],
     ["scenes", "场景背景"], ["props", "道具"], ["reference_images", "参考图"], ["storyboard", "分镜"],
-    ["plans", "声音/QA"], ["media", "视频/交付"]
+    ["plans", "声音/QA"], ["media", "视频/交付"],
+    ["music_plan", "全片配乐方案"], ["music", "音乐"], ["compose", "最终合成"], ["delivery_qa", "交付质检"]
   ];
   $("#stageTabs").innerHTML = tabs.map(([id, label]) =>
     `<button class="tab ${state.tab === id ? "active" : ""}" data-tab="${id}">${label}</button>`
@@ -210,6 +221,61 @@ function renderTabs() {
       renderDetail();
     });
   });
+}
+
+function renderMissingStageWorkbench(stage, artifacts) {
+  const jobs = state.detail?.jobs || [];
+  const latestJob = [...jobs].reverse().find(item => item.stage === stage);
+  const batch = artifacts.find(item => item.kind === "batch_video");
+  const musicPlan = artifacts.find(item => item.kind === "music_plan");
+  const music = artifacts.find(item => item.kind === "music");
+  const compose = artifacts.find(item => item.kind === "compose");
+  const previewApproved = (state.detail?.approvals || []).some(item => item.gate === "preview_approved" && item.status === "approved");
+  const batchReady = Boolean(batch?.status === "ready" && batch?.content?.coverage_complete !== false);
+  const canSkipMusic = Boolean(batchReady && previewApproved && !music?.status && !compose?.status);
+  const jobNote = latestJob ? `<div class="stage-empty-job ${escapeHtml(latestJob.status || "")}"><b>最近任务：${escapeHtml(latestJob.status || "")}</b><span>${escapeHtml(friendlyJobMessage(stage, latestJob.status, latestJob.message || ""))}</span></div>` : "";
+  if (stage === "music_plan") {
+    return `<section class="stage-empty-workbench music-stage-empty">
+      <div class="stage-empty-head"><div><span class="eyebrow">MUSIC PLAN</span><h3>全片配乐方案</h3></div><span class="pill ${latestJob?.status === "failed" ? "failed" : "stale"}">${latestJob?.status === "failed" ? "上次生成失败" : "尚未生成"}</span></div>
+      <p>这里会根据当前已锁定 storyboard 的动态镜头数与时间线、对白时间窗和 sound plan 生成 Cue Sheet。不会修改已经完成的视频。</p>
+      ${jobNote}
+      <div class="stage-empty-actions"><button class="button primary" data-open-stage-flow="music_plan">进入配乐方案对话 / 重跑</button><button class="button secondary" data-jump-tab="music">暂不配乐，查看音乐跳过选项</button></div>
+    </section>`;
+  }
+  if (stage === "music") {
+    return `<section class="stage-empty-workbench music-stage-empty">
+      <div class="stage-empty-head"><div><span class="eyebrow">MUSIC RENDER</span><h3>音乐</h3></div><span class="pill stale">未生成独立 BGM</span></div>
+      <p>${musicPlan ? "配乐方案已经存在，但当前未配置独立音乐生成 Provider。" : "当前没有独立 BGM 文件。可以先生成配乐方案，也可以明确跳过音乐，直接进入最终视频拼接。"}</p>
+      ${jobNote}
+      <div class="music-skip-explainer"><b>跳过音乐不会删除声音</b><span>最终合成会保留每镜 Seedance 已有的法语对白、环境音和 Foley，只是不额外混入独立 BGM。</span></div>
+      <div class="stage-empty-actions">${musicPlan ? `<button class="button secondary" data-jump-tab="music_plan">查看全片配乐方案</button>` : `<button class="button secondary" data-open-stage-flow="music_plan">先生成全片配乐方案</button>`}${canSkipMusic ? `<button class="button warn" data-skip-music-inline>跳过音乐，直接进入合成</button>` : `<span class="artifact-meta">${!batchReady ? "需要先完成完整批量视频" : !previewApproved ? "需要先批准单镜 Preview" : "当前状态暂不可跳过音乐"}</span>`}</div>
+    </section>`;
+  }
+  if (stage === "compose") {
+    const skipped = music?.content?.skipped === true && music?.content?.mode === "skipped_no_bgm";
+    return `<section class="stage-empty-workbench compose-stage-empty">
+      <div class="stage-empty-head"><div><span class="eyebrow">FINAL COMPOSE</span><h3>最终合成</h3></div><span class="pill stale">尚未合成</span></div>
+      <p>${skipped ? "独立音乐已明确跳过。现在可直接将当前 storyboard 对应的完整批量镜头按 shot_index 拼接为母版，并保留镜头原生音轨。" : "最终合成尚未执行。完成或明确跳过音乐后即可进入这里。"}</p>
+      ${jobNote}
+      <div class="stage-empty-actions"><button class="button primary" data-open-stage-flow="compose">进入最终合成对话 / 执行</button>${!skipped && canSkipMusic ? `<button class="button secondary" data-skip-music-inline>先跳过音乐</button>` : ""}</div>
+    </section>`;
+  }
+  return `<div class="empty-canvas">该阶段尚无产物。使用“制作对话流”推进可用阶段。</div>`;
+}
+
+function bindStageEmptyWorkbenchActions() {
+  document.querySelectorAll("[data-jump-tab]").forEach(button => button.addEventListener("click", () => {
+    state.tab = button.dataset.jumpTab || "flow";
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-open-stage-flow]").forEach(button => button.addEventListener("click", () => {
+    state.chatStageOverride = button.dataset.openStageFlow || "";
+    state.tab = "flow";
+    renderDetail();
+    const input = $("#stageGuidanceInput");
+    if (input) input.focus();
+  }));
+  document.querySelectorAll("[data-skip-music-inline]").forEach(button => button.addEventListener("click", () => skipMusicAndContinue().catch(error => toast(error.message))));
 }
 
 function renderArtifacts(artifacts) {
@@ -240,7 +306,8 @@ function renderArtifacts(artifacts) {
   }
   const root = $("#artifactGrid");
   if (!visible.length) {
-    root.innerHTML = `<div class="empty-canvas">该阶段尚无产物。使用“推进下一步”运行可用阶段。</div>`;
+    root.innerHTML = renderMissingStageWorkbench(state.tab, artifacts);
+    bindStageEmptyWorkbenchActions();
     return;
   }
   root.innerHTML = visible.map(artifactCard).join("");
@@ -251,6 +318,8 @@ function renderArtifacts(artifacts) {
   bindStoryboardUi();
   bindDialoguePlanUi();
   bindSoundPlanUi();
+  bindPreviewUi();
+  bindBatchVideoUi();
 }
 
 function renderAgentContracts() {
@@ -275,18 +344,26 @@ function artifactCard(a) {
   const reviewRow = state.detail?.stage_reviews?.[a.kind];
   const currentReview = reviewRow && Number(reviewRow.artifact_revision || 0) === Number(a.revision || 0) ? (reviewRow.review || {}) : null;
   const reviewAction = String(currentReview?.recommended_action || "");
+  const previewWaitingForHuman = a.kind === "preview" && reviewAction === "wait_for_user";
   const reviewBadge = reviewAction === "proceed"
     ? `<span class="pill ready review-status-pill" title="总管复盘已通过。右侧二次确认如仍显示 pending，表示等待人工确认，不代表总管拒绝。">总管已通过</span>`
+    : (previewWaitingForHuman
+      ? `<span class="pill stale review-status-pill" title="单镜已经生成，等待你人工审看并决定是否批准进入批量阶段。">待人工审看</span>`
     : (["regenerate_current", "wait_for_user"].includes(reviewAction)
       ? `<span class="pill stale review-status-pill" title="总管复盘认为当前 revision 仍需处理。">总管待修</span>`
-      : "");
+      : ""));
   const visualStageClass = ["characters", "scenes", "props", "reference_images"].includes(a.kind) ? " asset-workbench-card" : "";
   const storyboardStageClass = a.kind === "storyboard" ? " storyboard-workbench-card" : "";
   const dialogueStageClass = a.kind === "dialogue_plan" ? " dialogue-workbench-card" : "";
   const soundStageClass = a.kind === "sound_plan" ? " sound-workbench-card" : "";
   const reviewStageClass = a.kind === "review" ? " review-workbench-card" : "";
+  const previewStageClass = a.kind === "preview" ? " preview-workbench-card" : "";
+  const batchStageClass = a.kind === "batch_video" ? " batch-video-workbench-card" : "";
+  const musicPlanStageClass = a.kind === "music_plan" ? " music-plan-workbench-card" : "";
+  const musicStageClass = a.kind === "music" ? " music-render-workbench-card" : "";
+  const composeStageClass = a.kind === "compose" ? " compose-workbench-card" : "";
   return `
-    <article class="artifact-card ${a.status}${visualStageClass}${storyboardStageClass}${dialogueStageClass}${soundStageClass}${reviewStageClass}">
+    <article class="artifact-card ${a.status}${visualStageClass}${storyboardStageClass}${dialogueStageClass}${soundStageClass}${reviewStageClass}${previewStageClass}${batchStageClass}${musicPlanStageClass}${musicStageClass}${composeStageClass}">
       <div class="artifact-card-header">
         <div><strong>${escapeHtml(a.name)}</strong><div class="artifact-meta">${escapeHtml(agent?.name || "未分配 Agent")} · rev ${a.revision} · ${escapeHtml(a.provider)}</div></div>
         <div class="artifact-header-actions">
@@ -305,9 +382,36 @@ function artifactCard(a) {
               ? `${renderSoundPlan(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
               : a.kind === "review"
                 ? `${renderReview(a.content)}${renderReviewExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+                : a.kind === "preview"
+                  ? `${renderPreview(a.content)}${renderPreviewExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+                  : a.kind === "batch_video"
+                    ? `${renderBatchVideo(a.content)}${renderBatchVideoExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+                  : a.kind === "music_plan"
+                    ? `${renderMusicPlan(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+                  : a.kind === "music"
+                    ? `${renderMusicRender(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
+                  : a.kind === "compose"
+                    ? `${renderCompose(a.content)}${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}`
                 : `${renderExecutionInfo(a.content?._execution)}${renderStageReview(a)}${renderContent(a.content, a.kind)}`}</div>
     </article>
   `;
+}
+
+function reviewItemText(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "object") {
+    const preferred = value.message || value.issue || value.description || value.text || value.reason || value.detail;
+    if (preferred) return String(preferred);
+    try { return JSON.stringify(value); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+
+function reviewList(value) {
+  if (Array.isArray(value)) return value.map(reviewItemText).filter(Boolean);
+  const one = reviewItemText(value);
+  return one ? [one] : [];
 }
 
 function renderStageReview(artifact) {
@@ -315,19 +419,33 @@ function renderStageReview(artifact) {
   if (!row || Number(row.artifact_revision || 0) !== Number(artifact.revision || 0)) return "";
   const review = row.review || {};
   const action = review.recommended_action || "";
-  const bad = ["regenerate_current", "wait_for_user"].includes(action);
+  const previewWaitingForHuman = artifact.kind === "preview" && action === "wait_for_user";
+  const bad = action === "regenerate_current" || (action === "wait_for_user" && !previewWaitingForHuman);
+  const deviations = reviewList(review.deviations);
+  const adjustments = reviewList(review.suggested_adjustments);
   return `<div class="director-review ${bad ? "blocking" : "ok"}">
     <b>总管生成复盘 · ${escapeHtml(action || "reviewed")}</b>
     ${review.assessment ? `<div>${escapeHtml(review.assessment)}</div>` : ""}
-    ${Array.isArray(review.deviations) && review.deviations.length ? `<div><strong>偏差：</strong>${escapeHtml(review.deviations.join("；"))}</div>` : ""}
-    ${Array.isArray(review.suggested_adjustments) && review.suggested_adjustments.length ? `<div><strong>建议：</strong>${escapeHtml(review.suggested_adjustments.join("；"))}</div>` : ""}
+    ${deviations.length ? `<div><strong>偏差：</strong>${escapeHtml(deviations.join("；"))}</div>` : ""}
+    ${adjustments.length ? `<div><strong>建议：</strong>${escapeHtml(adjustments.join("；"))}</div>` : ""}
   </div>`;
+}
+
+function friendlyJobMessage(stage, status, message) {
+  const raw = String(message || "");
+  if (String(status || "").toLowerCase() === "failed" && raw.includes("Model response could not be parsed as the expected JSON object")) {
+    if (stage === "music_plan") {
+      return "模型已经返回配乐内容，但 JSON 封装解析失败。下一次重跑本节点会使用精简配乐上下文，并在必要时自动执行一次 JSON 结构修复；不会重新生成任何视频。";
+    }
+    return "模型已经返回内容，但结构化 JSON 解析失败。可重跑当前节点；不会自动重跑无关媒体阶段。";
+  }
+  return raw.length > 900 ? raw.slice(0, 900) + "…" : raw;
 }
 
 function activityEventText(item) {
   const type = item.type || "event";
   const p = item.payload || {};
-  if (type === "job.updated") return `${state.meta.labels[p.stage] || p.stage || "任务"} · ${p.status || ""} · ${Number(p.progress || 0)}% · ${p.message || ""}`;
+  if (type === "job.updated") return `${state.meta.labels[p.stage] || p.stage || "任务"} · ${p.status || ""} · ${Number(p.progress || 0)}% · ${friendlyJobMessage(p.stage, p.status, p.message)}`;
   if (type === "artifact.updated") return `${state.meta.labels[p.kind] || p.kind || "产物"} 已更新 · rev ${p.revision || ""} · ${p.status || ""}`;
   if (type === "approval.changed") return `审批 ${p.gate || ""} → ${p.status || ""}`;
   if (type === "director.review") return `${state.meta.labels[p.stage] || p.stage || "阶段"} 总管复盘 → ${p.recommended_action || "reviewed"}${p.assessment ? ` · ${p.assessment}` : ""}`;
@@ -770,6 +888,294 @@ function renderReviewExecutionInfo(execution) {
   return `<details class="review-context-details"><summary>查看总管执行上下文</summary>${body}</details>`;
 }
 
+function renderPreviewExecutionInfo(execution) {
+  const body = renderExecutionInfo(execution);
+  if (!body) return "";
+  return `<details class="preview-details preview-execution-details"><summary>查看本次总管执行要求</summary>${body}</details>`;
+}
+
+function batchExpectedIndices() {
+  const storyboard = (state.detail?.artifacts || []).find(item => item.kind === "storyboard");
+  return Array.isArray(storyboard?.content?.shots)
+    ? storyboard.content.shots.map(shot => Number(shot?.index || 0)).filter(index => index > 0)
+    : [];
+}
+
+function batchCoverage(content) {
+  const items = Array.isArray(content?.items) ? content.items : [];
+  const expected = batchExpectedIndices();
+  const succeeded = new Set(items
+    .filter(item => String(item?.status || "").toLowerCase() === "succeeded")
+    .map(item => Number(item?.shot_index || 0))
+    .filter(index => index > 0));
+  const failed = items.filter(item => String(item?.status || "").toLowerCase() === "failed");
+  const missing = expected.filter(index => !succeeded.has(index));
+  return {items, expected, succeeded, failed, missing};
+}
+
+function renderBatchVideoExecutionInfo(execution) {
+  const body = renderExecutionInfo(execution);
+  if (!body) return "";
+  return `<details class="batch-video-details batch-execution-details"><summary>查看本次总管执行要求</summary>${body}</details>`;
+}
+
+function renderBatchShotModal(item) {
+  if (!item) return "";
+  const url = String(item.url || item.remote_url || "");
+  const refs = Array.isArray(item.reference_keys) ? item.reference_keys : [];
+  const probe = item.audio_probe && typeof item.audio_probe === "object" ? item.audio_probe : {};
+  return `<div class="batch-video-overlay" data-batch-video-overlay>
+    <div class="batch-video-dialog" role="dialog" aria-modal="true">
+      <div class="batch-video-dialog-head">
+        <div><strong>Shot ${escapeHtml(item.shot_index ?? "—")}</strong><div class="artifact-meta">${escapeHtml(item.model || "Seedance")} · ${escapeHtml(item.provider_job_id || "reused clip")}</div></div>
+        <button class="mini-button" data-close-batch-shot>关闭</button>
+      </div>
+      <div class="batch-video-dialog-body">
+        <div class="batch-video-dialog-player">${url ? `<video controls playsinline preload="metadata" src="${escapeHtml(url)}"></video>` : `<div class="preview-player-empty">视频地址缺失</div>`}</div>
+        <div class="batch-video-dialog-meta">
+          <div class="preview-stat-grid">
+            <div><span>状态</span><b>${escapeHtml(item.status || "unknown")}</b></div>
+            <div><span>来源</span><b>${escapeHtml(item.reused_from ? `复用 ${item.reused_from}` : "本轮 Seedance")}</b></div>
+            <div><span>输出</span><b>${escapeHtml(item.resolution || "—")} · ${escapeHtml(item.ratio || "—")}</b></div>
+            <div><span>音频</span><b>${probe.has_audio === true ? `已检测${probe.codec ? ` · ${probe.codec}` : ""}` : (item.generate_audio ? "请求开启" : "关闭")}</b></div>
+          </div>
+          <div class="preview-reference-chips">${refs.map(key => `<span>${escapeHtml(key)}</span>`).join("") || `<span>无 reference_keys 记录</span>`}</div>
+          ${item.error ? `<div class="batch-video-error">${escapeHtml(item.error)}</div>` : ""}
+          <div class="batch-video-dialog-actions">${url ? `<a class="mini-button preview-link-button" href="${escapeHtml(url)}" target="_blank" rel="noopener">新窗口打开</a><a class="mini-button preview-link-button" href="${escapeHtml(url)}" download>下载此镜</a>` : ""}</div>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function renderBatchVideo(content) {
+  content = content && typeof content === "object" ? content : {};
+  const coverage = batchCoverage(content);
+  const itemsByIndex = new Map(coverage.items.map(item => [Number(item?.shot_index || 0), item]));
+  const reusable = coverage.items.filter(item => item?.reused_from).length;
+  const newlyGenerated = coverage.items.filter(item => !item?.reused_from && String(item?.status || "").toLowerCase() === "succeeded").length;
+  const expectedCount = coverage.expected.length || Number(content.storyboard_shots || content.requested || coverage.items.length || 0);
+  const completedCount = coverage.succeeded.size;
+  const previewApproved = (state.detail?.approvals || []).some(item => item.gate === "preview_approved" && item.status === "approved");
+  const activeDetail = Number(state.batchVideoDetailShot || 0);
+  const detailItem = activeDetail ? itemsByIndex.get(activeDetail) : null;
+  const executionMode = content.execution_mode === "parallel_waves"
+    ? `并发波次 · ${Number(content.batch_concurrency || 0)} 路`
+    : (content.execution_mode === "sequential" ? "顺序执行" : "历史批量");
+  const coverageStatus = coverage.missing.length === 0 && !coverage.failed.length && completedCount === expectedCount;
+  const batchArtifact = (state.detail?.artifacts || []).find(item => item.kind === "batch_video");
+  const batchReviewRow = state.detail?.stage_reviews?.batch_video;
+  const batchReview = batchReviewRow && Number(batchReviewRow.artifact_revision || 0) === Number(batchArtifact?.revision || 0) ? (batchReviewRow.review || {}) : {};
+  const batchReviewAction = String(batchReview.recommended_action || "");
+  const batchReviewBlocked = ["regenerate_current", "wait_for_user"].includes(batchReviewAction);
+  const displayIndices = coverage.expected.length ? coverage.expected : coverage.items.map(item => Number(item?.shot_index || 0)).filter(Boolean);
+  const cards = displayIndices.map(index => {
+    const item = itemsByIndex.get(index);
+    if (!item) return `<article class="batch-shot-card missing"><div class="batch-shot-thumb placeholder"><span>Shot ${index}</span><small>待生成</small></div><div class="batch-shot-card-meta"><b>Shot ${index}</b><span>missing</span></div></article>`;
+    const status = String(item.status || "unknown").toLowerCase();
+    const url = String(item.url || item.remote_url || "");
+    const source = item.reused_from === "approved_preview" ? "复用已批准 Preview" : item.reused_from === "batch_video" ? "复用既有批量" : "本轮生成";
+    return `<article class="batch-shot-card ${escapeHtml(status)}" data-open-batch-shot="${index}">
+      <div class="batch-shot-thumb">${url ? `<video muted playsinline preload="metadata" src="${escapeHtml(url)}"></video>` : `<span>Shot ${index}</span>`}<div class="batch-shot-overlay-label">Shot ${index}</div></div>
+      <div class="batch-shot-card-meta"><b>${escapeHtml(source)}</b><span>${escapeHtml(status)}${item.duration_seconds ? ` · ${escapeHtml(item.duration_seconds)}s` : ""}</span></div>
+    </article>`;
+  }).join("");
+  return `<div class="batch-video-workbench">
+    <div class="batch-video-summary ${coverageStatus ? "complete" : "partial"}">
+      <div class="batch-video-summary-main"><strong>批量视频覆盖</strong><span>${completedCount}/${expectedCount || "—"} 镜完成${coverage.missing.length ? ` · 缺 ${coverage.missing.length} 镜` : " · 已完整覆盖"}</span></div>
+      <div class="batch-video-summary-pills">
+        ${previewStatusPill(coverageStatus ? "COVERAGE PASS" : "INCOMPLETE", coverageStatus ? "pass" : "warn")}
+        ${previewStatusPill(executionMode, content.execution_mode === "parallel_waves" ? "pass" : "")}
+        ${previewStatusPill(`复用 ${reusable}`, reusable ? "pass" : "")}
+        ${previewStatusPill(`新生成 ${newlyGenerated}`, newlyGenerated ? "pass" : "")}
+      </div>
+      ${coverage.missing.length ? `<div class="batch-video-resume-bar"><div><b>仍有未完成镜头</b><span>${escapeHtml(coverage.missing.map(index => `Shot ${String(index).padStart(2, "0")}`).join("、"))}</span></div><button class="button primary" data-resume-batch-video ${previewApproved ? "" : "disabled"}>${previewApproved ? `补齐缺失 ${coverage.missing.length} 镜（复用已成功）` : "请先批准单镜 Preview"}</button></div>` : ""}
+      ${coverageStatus && batchReviewBlocked ? `<div class="batch-video-resume-bar batch-review-revalidate-bar"><div><b>视频覆盖已完整，但总管复盘仍显示待修</b><span>可重新审计当前 14 镜，不会重新提交 Seedance，也不会产生新的视频额度。</span></div><button class="button primary" data-revalidate-batch-video>重新审计（不生成视频）</button></div>` : ""}
+    </div>
+    <div class="batch-shot-grid">${cards}</div>
+    <details class="batch-video-details"><summary>批量执行审计</summary>
+      <div class="batch-audit-grid">
+        <div><span>Storyboard 镜头</span><b>${expectedCount || "—"}</b></div>
+        <div><span>本轮新提交</span><b>${escapeHtml(content.submitted_new_tasks ?? "历史未记录")}</b></div>
+        <div><span>并发</span><b>${escapeHtml(content.batch_concurrency ?? "历史未记录")}</b></div>
+        <div><span>Fail-stop</span><b>${escapeHtml(content.fail_stop_scope || "历史未记录")}</b></div>
+      </div>
+      <div class="artifact-meta">${escapeHtml(content.note || "历史产物未记录批量执行策略。")}</div>
+    </details>
+    ${renderBatchShotModal(detailItem)}
+  </div>`;
+}
+
+async function resumeBatchVideo(button) {
+  if (!state.selectedId) return;
+  const batchArtifact = (state.detail?.artifacts || []).find(item => item.kind === "batch_video");
+  if (!batchArtifact) throw new Error("当前没有可续跑的批量视频产物");
+  const coverage = batchCoverage(batchArtifact.content || {});
+  if (!coverage.missing.length) return;
+  const previewApproved = (state.detail?.approvals || []).some(item => item.gate === "preview_approved" && item.status === "approved");
+  if (!previewApproved) throw new Error("请先人工批准 Shot 01 单镜预览，再进入批量补齐");
+  const missingLabel = coverage.missing.map(index => `Shot ${String(index).padStart(2, "0")}`).join("、");
+  if (!window.confirm(`将只补齐：${missingLabel}。\n已成功镜头与已批准 Preview 会复用，不重复提交收费任务。继续吗？`)) return;
+  if (button) button.disabled = true;
+  try {
+    const feedback = `仅补齐当前 batch_video 缺失镜头（${missingLabel}）；必须复用已有 succeeded 镜头与已批准 preview，不重复提交已经成功的镜头。保持所有上游锁定内容与当前 Seedance 参数不变。`;
+    const job = await api(`/api/workspaces/${state.selectedId}/stages/batch_video/regenerate`, {
+      method: "POST",
+      body: JSON.stringify({feedback}),
+    });
+    state.batchVideoDetailShot = null;
+    state.chatStageOverride = "batch_video";
+    state.tab = "flow";
+    upsertJobState(job);
+    await refreshCurrent();
+    toast(`已开始补齐 ${coverage.missing.length} 个缺失镜头；已有成功视频不会重复生成`);
+    syncJobWatcher();
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function revalidateBatchVideo(button) {
+  if (!state.selectedId) return;
+  if (button) button.disabled = true;
+  try {
+    toast("正在重新审计当前批量视频，不会生成任何新视频…");
+    const result = await api(`/api/workspaces/${state.selectedId}/batch-video/revalidate`, {method: "POST"});
+    await refreshCurrent();
+    state.tab = "flow";
+    renderDetail();
+    const validation = result.batch_validation || {};
+    toast(validation.status === "pass"
+      ? `批量视频复验通过：${validation.actual_items || 0}/${validation.expected_items || 0} 镜，未重新生成视频`
+      : "批量视频复验发现真实结构问题，请查看审计结果");
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindBatchVideoUi() {
+  document.querySelectorAll("[data-open-batch-shot]").forEach(card => card.addEventListener("click", event => {
+    if (event.target.closest("a,button")) return;
+    state.batchVideoDetailShot = Number(card.dataset.openBatchShot || 0) || null;
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-close-batch-shot], [data-batch-video-overlay]").forEach(element => element.addEventListener("click", event => {
+    if (element.hasAttribute("data-batch-video-overlay") && event.target !== element) return;
+    state.batchVideoDetailShot = null;
+    renderDetail();
+  }));
+  document.querySelectorAll("[data-resume-batch-video]").forEach(button => button.addEventListener("click", () => {
+    resumeBatchVideo(button).catch(error => { button.disabled = false; toast(error.message); });
+  }));
+  document.querySelectorAll("[data-revalidate-batch-video]").forEach(button => button.addEventListener("click", () => {
+    revalidateBatchVideo(button).catch(error => { button.disabled = false; toast(error.message); });
+  }));
+}
+
+function previewStatusPill(label, status = "") {
+  const normalized = String(status || "").toLowerCase();
+  const klass = ["pass", "ready", "succeeded", "true"].includes(normalized)
+    ? "ready"
+    : (["warn", "warning", "stale", "false"].includes(normalized) ? "stale" : "");
+  return `<span class="pill ${klass}">${escapeHtml(label)}</span>`;
+}
+
+function renderPreview(content) {
+  content = content && typeof content === "object" ? content : {};
+  const url = String(content.url || content.remote_url || "");
+  const refs = Array.isArray(content.reference_keys) ? content.reference_keys : [];
+  const preflight = content.preflight_checks && typeof content.preflight_checks === "object" ? content.preflight_checks : {};
+  const resolver = preflight.reference_resolver && typeof preflight.reference_resolver === "object" ? preflight.reference_resolver : {};
+  const provenance = preflight.trusted_provenance_tos && typeof preflight.trusted_provenance_tos === "object" ? preflight.trusted_provenance_tos : {};
+  const assembly = content.assembly_log && typeof content.assembly_log === "object" ? content.assembly_log : {};
+  const digest = content.request_payload_digest && typeof content.request_payload_digest === "object" ? content.request_payload_digest : {};
+  const audioProbe = content.audio_probe && typeof content.audio_probe === "object" ? content.audio_probe : {};
+  const hasAudio = audioProbe.has_audio;
+  const audioLabel = hasAudio === true
+    ? `音轨已检测${audioProbe.codec ? ` · ${audioProbe.codec}` : ""}`
+    : hasAudio === false
+      ? "未检测到音轨"
+      : (content.generate_audio ? "请求生成音频 · 尚无探测记录" : "未请求生成音频");
+  const audioStatus = hasAudio === true ? "pass" : (hasAudio === false ? "warn" : "");
+  const providerEcho = content.provider_generate_audio_echo;
+  const echoLabel = providerEcho === true ? "Provider 回显 audio=true" : providerEcho === false ? "Provider 回显 audio=false" : "Provider 未回显音频参数";
+  const preflightLabel = preflight.status
+    ? `预检 ${String(preflight.status).toUpperCase()}`
+    : "历史预览 · 无预检审计字段";
+  const revisions = assembly.upstream_revisions || digest.upstream_revisions || {};
+  const revisionText = Object.entries(revisions)
+    .filter(([, value]) => Number(value) > 0)
+    .map(([key, value]) => `${key} rev${value}`)
+    .join(" · ");
+  const dialogue = assembly.dialogue_plan || {};
+  const sound = assembly.sound_plan || {};
+  const soundFields = Array.isArray(sound.fields_present) ? sound.fields_present : [];
+  const trustedItems = Array.isArray(provenance.items) ? provenance.items : [];
+  const previewApproval = (state.detail?.approvals || []).find(item => item.gate === "preview_approved");
+  const previewApproved = previewApproval?.status === "approved";
+
+  return `<div class="preview-workbench">
+    <section class="preview-player-panel">
+      <div class="preview-player-shell">
+        ${url ? `<video class="preview-player" controls playsinline preload="metadata" src="${escapeHtml(url)}"></video>` : `<div class="preview-player-empty">预览视频地址缺失</div>`}
+      </div>
+      <div class="preview-player-actions">
+        ${url ? `<a class="mini-button preview-link-button" href="${escapeHtml(url)}" target="_blank" rel="noopener">新窗口打开</a><a class="mini-button preview-link-button" href="${escapeHtml(url)}" download>下载预览</a>` : ""}
+        <span class="artifact-meta">Shot ${escapeHtml(content.shot_index ?? "—")} · ${escapeHtml(content.duration_seconds ?? "—")}s</span>
+      </div>
+    </section>
+    <section class="preview-inspector">
+      <div class="preview-summary-head">
+        <div><strong>单镜预览回执</strong><div class="artifact-meta">${escapeHtml(content.provider_job_id || "尚无 provider job id")}</div></div>
+        ${previewStatusPill(String(content.status || "unknown"), content.status)}
+      </div>
+      <div class="preview-stat-grid">
+        <div><span>模型</span><b>${escapeHtml(content.model || "—")}</b></div>
+        <div><span>输出</span><b>${escapeHtml(content.resolution || "—")} · ${escapeHtml(content.ratio || "—")}</b></div>
+        <div><span>参考图</span><b>${escapeHtml(content.reference_image_count ?? refs.length)} 张</b></div>
+        <div><span>音频</span><b>${escapeHtml(content.generate_audio ? "开启" : "关闭")}</b></div>
+      </div>
+      <div class="preview-audit-pills">
+        ${previewStatusPill(preflightLabel, preflight.status)}
+        ${previewStatusPill(audioLabel, audioStatus)}
+        ${previewStatusPill(echoLabel, providerEcho === true ? "pass" : "")}
+      </div>
+      <div class="preview-approval-bar ${previewApproved ? "approved" : "pending"}">
+        <div><b>${previewApproved ? "此单镜已人工批准" : "等待人工审看"}</b><span>${previewApproved ? "batch_video gate 已打开；仍只会在你明确推进后提交批量任务。" : "确认画面、对白和声音符合要求后，再批准此单镜。"}</span></div>
+        ${previewApproved ? previewStatusPill("PREVIEW APPROVED", "pass") : `<button class="button primary preview-approve-button" data-preview-approve>确认此单镜预览</button>`}
+      </div>
+      <div class="preview-hydration-summary">
+        <div><span>上游 revision</span><p>${escapeHtml(revisionText || "历史产物未记录")}</p></div>
+        <div><span>对白水合</span><p>${dialogue.hydrated === true ? `${escapeHtml(dialogue.language || "") || "目标语言"} · ${Number(dialogue.line_count || 0)} 条 · lip-sync ${escapeHtml((dialogue.lip_sync_targets || []).join(", ") || "—")}` : "历史产物未记录"}</p></div>
+        <div><span>声音水合</span><p>${sound.hydrated === true ? escapeHtml(soundFields.join(" · ") || "已水合") : "历史产物未记录"}</p></div>
+      </div>
+      <details class="preview-details"><summary>参考图与 provenance / TOS 预检</summary>
+        <div class="preview-reference-chips">${refs.map(key => `<span>${escapeHtml(key)}</span>`).join("") || `<span>未记录 reference_keys</span>`}</div>
+        ${resolver.human_combinations_expanded?.length ? `<div class="preview-audit-note"><b>人物组合已展开：</b>${escapeHtml(resolver.human_combinations_expanded.join("；"))}</div>` : ""}
+        ${trustedItems.length ? `<div class="preview-preflight-list">${trustedItems.map(item => `<div><b>${escapeHtml(item.canonical_key || "reference")}</b><span>${escapeHtml(item.transport || "")}${item.contains_person ? " · trusted portrait" : ""}${item.tos_archived ? " · TOS archived" : ""}</span></div>`).join("")}</div>` : `<div class="artifact-meta">当前预览产物未保存逐图 preflight 明细；重新生成后会自动记录。</div>`}
+      </details>
+      <details class="preview-details"><summary>执行审计与 payload digest</summary>
+        <div class="preview-digest-grid">
+          <div><span>Payload SHA-256</span><code>${escapeHtml(digest.sha256 || "历史产物未记录")}</code></div>
+          <div><span>Prompt SHA-256</span><code>${escapeHtml(digest.prompt_sha256 || "历史产物未记录")}</code></div>
+        </div>
+      </details>
+    </section>
+  </div>`;
+}
+
+function bindPreviewUi() {
+  document.querySelectorAll("[data-preview-approve]").forEach(button => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await setApproval("preview_approved", "approved");
+    } catch (error) {
+      button.disabled = false;
+      toast(error.message);
+    }
+  }));
+}
+
 function renderReview(content) {
   const checks = Array.isArray(content?.checks) ? content.checks : [];
   const blockingFailures = Array.isArray(content?.blocking_failures) ? content.blocking_failures : [];
@@ -814,6 +1220,175 @@ function renderReview(content) {
     </div>
     ${blockerHtml}
     <section class="review-checks"><div class="review-section-title"><strong>全部检查</strong><span>失败与警告优先显示；通过项保留用于审计</span></div><div class="review-check-grid">${cards || '<div class="empty-canvas">当前没有 QA 检查项。</div>'}</div></section>
+  </div>`;
+}
+
+
+function musicValue(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return value.map(musicValue).filter(Boolean).join("；") || "—";
+  if (typeof value === "object") {
+    const preferred = value.text ?? value.description ?? value.note ?? value.label ?? value.name;
+    if (preferred !== undefined) return musicValue(preferred);
+    try { return JSON.stringify(value); } catch (_) { return String(value); }
+  }
+  return String(value);
+}
+
+function musicShotRange(cue) {
+  const start = cue?.start_shot ?? "?";
+  const end = cue?.end_shot ?? start;
+  return String(start) === String(end) ? `Shot ${start}` : `Shot ${start}–${end}`;
+}
+
+function musicTimeRange(cue) {
+  const start = cue?.start_time ?? cue?.start_seconds;
+  const end = cue?.end_time ?? cue?.end_seconds;
+  if (start === undefined && end === undefined) return "—";
+  return `${start ?? "?"}s → ${end ?? "?"}s`;
+}
+
+function musicAvoidanceHtml(value) {
+  if (value === null || value === undefined || value === "") return `<span class="music-empty">未记录</span>`;
+  if (typeof value !== "object" || Array.isArray(value)) return `<p>${escapeHtml(musicValue(value))}</p>`;
+  const active = value.active;
+  const windows = Array.isArray(value.windows) ? value.windows : (value.window ? [value.window] : []);
+  const note = value.sidechain_logic ?? value.note ?? value.description ?? "";
+  const windowHtml = windows.length ? `<div class="music-window-chips">${windows.map(win => {
+    if (!win || typeof win !== "object") return `<span>${escapeHtml(musicValue(win))}</span>`;
+    const start = win.start ?? win.start_time ?? win.relative_start ?? "?";
+    const end = win.end ?? win.end_time ?? win.relative_end ?? "?";
+    const duck = win.duck_db ?? win.attenuation_db;
+    return `<span>${escapeHtml(`${start}–${end}s${duck !== undefined ? ` · ${duck} dB` : ""}`)}</span>`;
+  }).join("")}</div>` : "";
+  return `<div class="music-avoidance-state ${active === false ? "off" : "on"}">${active === false ? "不需避让" : active === true ? "对白避让开启" : "避让策略"}</div>${windowHtml}${note ? `<p>${escapeHtml(musicValue(note))}</p>` : ""}`;
+}
+
+function renderMusicPlan(content) {
+  content = content && typeof content === "object" ? content : {};
+  const cues = Array.isArray(content.cues) ? content.cues : [];
+  const validation = content.music_plan_validation && typeof content.music_plan_validation === "object" ? content.music_plan_validation : {};
+  const validationStatus = String(validation.status || "");
+  const expectedCount = Number(validation.expected_shot_count || 0);
+  const coveredCount = Array.isArray(validation.covered_shots) ? validation.covered_shots.length : 0;
+  const missing = Array.isArray(validation.missing_shots) ? validation.missing_shots : [];
+  const invalidRanges = Array.isArray(validation.invalid_ranges) ? validation.invalid_ranges : [];
+  const parseRecovery = content._parse_recovery && typeof content._parse_recovery === "object" ? content._parse_recovery : null;
+  const cards = cues.map((cue, idx) => {
+    const id = cue?.cue_id || `CUE_${String(idx + 1).padStart(2, "0")}`;
+    const mood = cue?.mood ?? cue?.emotion ?? "";
+    const instrumentation = cue?.instrumentation ?? cue?.palette ?? "";
+    const intensity = cue?.intensity ?? cue?.energy ?? "";
+    const avoidance = cue?.dialogue_avoidance ?? cue?.ducking;
+    const silent = /silence|no[- ]?bgm|silent|vide sonore/i.test(`${musicValue(mood)} ${musicValue(instrumentation)}`);
+    return `<article class="music-cue-card ${silent ? "silent" : "active"}">
+      <div class="music-cue-head">
+        <div><span class="music-cue-id">${escapeHtml(id)}</span><span class="music-cue-range">${escapeHtml(musicShotRange(cue))}</span></div>
+        <span class="pill ${silent ? "" : "ready"}">${escapeHtml(silent ? "NO BGM" : musicTimeRange(cue))}</span>
+      </div>
+      <div class="music-cue-mood">${escapeHtml(musicValue(mood))}</div>
+      <div class="music-cue-grid">
+        <div><span>Instrumentation</span><p>${escapeHtml(musicValue(instrumentation))}</p></div>
+        <div><span>Intensity</span><p>${escapeHtml(musicValue(intensity))}</p></div>
+      </div>
+      <div class="music-cue-avoidance"><span>Dialogue avoidance</span>${musicAvoidanceHtml(avoidance)}</div>
+    </article>`;
+  }).join("");
+  const validationClass = validationStatus === "fail" ? "blocking" : (validationStatus === "pass" ? "ok" : "neutral");
+  return `<div class="music-plan-workbench">
+    <div class="music-plan-summary ${validationClass}">
+      <div class="music-plan-summary-main"><strong>全片 BGM Cue Sheet</strong><span>${cues.length} cues${expectedCount ? ` · 镜头覆盖 ${coveredCount}/${expectedCount}` : ""}${validation.total_duration_seconds !== undefined ? ` · ${escapeHtml(validation.total_duration_seconds)}s` : ""}</span></div>
+      <div class="music-plan-summary-pills">
+        ${previewStatusPill(validationStatus ? `Harness ${validationStatus.toUpperCase()}` : "未做结构校验", validationStatus === "pass" ? "pass" : (validationStatus === "fail" ? "fail" : "warn"))}
+        ${previewStatusPill(content.status || "planned", String(content.status || "").toLowerCase() === "ready" ? "pass" : "")}
+        ${parseRecovery ? previewStatusPill("JSON 自动修复", "warn") : ""}
+      </div>
+      ${missing.length ? `<div class="music-plan-warning"><b>缺失镜头覆盖</b><span>${escapeHtml(missing.map(x => `Shot ${x}`).join("、"))}</span></div>` : ""}
+      ${invalidRanges.length ? `<div class="music-plan-warning"><b>无效 Cue 范围</b><span>${escapeHtml(musicValue(invalidRanges))}</span></div>` : ""}
+    </div>
+    <div class="music-plan-overview">
+      <section><span>Global style</span><p>${escapeHtml(musicValue(content.global_style))}</p></section>
+      <section><span>Render mode</span><p>${escapeHtml(musicValue(content.render_mode))}</p></section>
+      <section><span>Global ducking</span><p>${escapeHtml(musicValue(content.ducking))}</p></section>
+    </div>
+    <div class="music-cue-grid-list">${cards || `<div class="empty-canvas">当前没有可显示的配乐 cue。</div>`}</div>
+    <details class="music-plan-details"><summary>查看完整配乐方案 JSON</summary><pre>${escapeHtml(JSON.stringify(content, null, 2))}</pre></details>
+  </div>`;
+}
+
+function renderMusicRender(content) {
+  content = content && typeof content === "object" ? content : {};
+  const mode = String(content.mode || "unknown");
+  const url = String(content.url || "");
+  const externalRendered = Boolean(url);
+  const explicitlySkipped = content.skipped === true || mode === "skipped_no_bgm";
+  const noSeparateBgm = explicitlySkipped || mode.includes("without_separate_bgm") || mode.includes("seedance_native_audio");
+  return `<div class="music-render-workbench">
+    <div class="music-render-summary ${noSeparateBgm ? "warning" : "ok"}">
+      <div><strong>音乐渲染状态</strong><span>${escapeHtml(content.status || "unknown")}</span></div>
+      <div class="music-plan-summary-pills">${previewStatusPill(mode, noSeparateBgm ? "warn" : "pass")}${previewStatusPill(externalRendered ? "独立音轨存在" : "无独立 BGM 文件", externalRendered ? "pass" : "warn")}</div>
+    </div>
+    ${noSeparateBgm ? `<div class="music-render-notice"><b>${explicitlySkipped ? "已明确跳过独立音乐" : "当前不会额外混入独立 BGM"}</b><span>${explicitlySkipped ? "最终合成将直接拼接现有视频，并保留每镜 Seedance 自带对白、环境音与 Foley；不会调用音乐 API，也不会生成新的音频媒体。" : "镜头保留 Seedance 原生对白 / 环境音；music_plan 仅作为后续配乐执行方案，除非配置独立音乐 Provider。"}</span></div>` : ""}
+    ${url ? `<div class="music-render-player">${renderMedia(url)}</div>` : ""}
+    <div class="music-plan-overview"><section><span>Mode</span><p>${escapeHtml(mode)}</p></section><section><span>说明</span><p>${escapeHtml(musicValue(content.note))}</p></section></div>
+    ${content.plan ? `<details class="music-plan-details"><summary>查看绑定的 Cue Sheet</summary>${renderMusicPlan(content.plan)}</details>` : ""}
+  </div>`;
+}
+
+function renderCompose(content) {
+  content = content && typeof content === "object" ? content : {};
+  const url = String(content.url || "");
+  const encoding = content.encoding && typeof content.encoding === "object" ? content.encoding : {};
+  const validation = content.compose_validation && typeof content.compose_validation === "object" ? content.compose_validation : {};
+  const checks = validation.checks && typeof validation.checks === "object" ? validation.checks : {};
+  const normalization = content.audio_normalization && typeof content.audio_normalization === "object" ? content.audio_normalization : {};
+  const probe = content.probe && typeof content.probe === "object" ? content.probe : {};
+  const audioProbe = probe.audio_stream && typeof probe.audio_stream === "object" ? probe.audio_stream : {};
+  const videoProbe = probe.video_stream && typeof probe.video_stream === "object" ? probe.video_stream : {};
+  const inputShotRows = Array.isArray(content.input_shots) ? content.input_shots : [];
+  const inputIndices = Array.isArray(content.input_shot_indices) ? content.input_shot_indices : [];
+  const expectedIndices = Array.isArray(content.expected_shot_indices) ? content.expected_shot_indices : [];
+  const inputShotCount = Number(content.input_shot_count || inputShotRows.length || inputIndices.length || 0);
+  const complete = expectedIndices.length ? inputIndices.length === expectedIndices.length && expectedIndices.every((v, i) => Number(v) === Number(inputIndices[i])) : inputShotCount > 0;
+  const validationStatus = String(validation.status || "").toLowerCase();
+  const auditReady = validationStatus === "pass";
+  const resampled = Array.isArray(normalization.resampled_shots) ? normalization.resampled_shots : [];
+  const actualDuration = Number(content.duration_seconds || validation.actual_duration_seconds || 0);
+  const expectedDuration = Number(content.expected_duration_seconds || validation.expected_duration_seconds || 0);
+  const delta = Number(content.duration_delta_seconds ?? validation.duration_delta_seconds ?? 0);
+  const tolerance = Number(validation.duration_tolerance_seconds || 0);
+  const requestedResolution = String(content.requested_resolution || validation.requested_resolution || "");
+  const requestedRatio = String(content.requested_ratio || validation.requested_ratio || "");
+  const checkRows = Object.entries(checks).map(([key, value]) => `<div class="compose-check-row"><span>${escapeHtml(key)}</span>${previewStatusPill(value === true ? "PASS" : "FAIL", value === true ? "pass" : "fail")}</div>`).join("");
+  return `<div class="compose-workbench">
+    <div class="compose-summary ${complete && (!validationStatus || auditReady) ? "ok" : "warning"}">
+      <div><strong>最终母版合成</strong><span>${escapeHtml(content.status || "unknown")} · ${escapeHtml(inputShotCount || "—")} 镜</span></div>
+      <div class="music-plan-summary-pills">${previewStatusPill(complete ? "镜头完整" : "镜头覆盖待核对", complete ? "pass" : "warn")}${validationStatus ? previewStatusPill(`合成校验 ${validationStatus.toUpperCase()}`, auditReady ? "pass" : "fail") : previewStatusPill("历史母版 · 无合成审计", "warn")}${previewStatusPill(content.music_mode || "music mode 未记录", (String(content.music_mode || "").includes("without_separate_bgm") || String(content.music_mode || "") === "skipped_no_bgm") ? "warn" : "")}</div>
+    </div>
+    <div class="compose-layout">
+      <div class="compose-player">${url ? renderMedia(url) : `<div class="preview-player-empty">母版文件尚未生成</div>`}</div>
+      <div class="compose-meta">
+        <div class="preview-stat-grid">
+          <div><span>输入镜头</span><b>${escapeHtml(inputShotCount || "—")}</b></div>
+          <div><span>Video</span><b>${escapeHtml(encoding.video || "—")}</b></div>
+          <div><span>Audio</span><b>${escapeHtml(encoding.audio || "—")}</b></div>
+          <div><span>Faststart</span><b>${escapeHtml(encoding.faststart === true ? "yes" : encoding.faststart === false ? "no" : "—")}</b></div>
+          <div><span>目标 / 实际时长</span><b>${expectedDuration ? `${expectedDuration.toFixed(1)}s / ${actualDuration.toFixed(1)}s` : (actualDuration ? `${actualDuration.toFixed(1)}s` : "—")}</b></div>
+          <div><span>时长偏差</span><b>${expectedDuration ? `${delta >= 0 ? "+" : ""}${delta.toFixed(3)}s${tolerance ? ` / ±${tolerance.toFixed(3)}s` : ""}` : "—"}</b></div>
+          <div><span>目标规格</span><b>${escapeHtml([requestedResolution, requestedRatio].filter(Boolean).join(" · ") || "—")}</b></div>
+          <div><span>ffprobe Video</span><b>${escapeHtml(videoProbe.codec_name ? `${videoProbe.codec_name} ${videoProbe.width || "?"}×${videoProbe.height || "?"}` : "—")}</b></div>
+          <div><span>ffprobe Audio</span><b>${escapeHtml(audioProbe.codec_name ? `${audioProbe.codec_name} · ${audioProbe.sample_rate || "?"} Hz · ${audioProbe.channels || "?"} ch` : "—")}</b></div>
+        </div>
+        ${expectedIndices.length ? `<div class="compose-shot-coverage"><span>Shot coverage</span><p>${escapeHtml(inputIndices.join(", "))}</p></div>` : ""}
+        <div class="compose-audio-normalization"><span>音频动态锁定 / 归一化</span><p>${normalization.enforced_by_ffmpeg === true ? `FFmpeg 目标 ${normalization.target_sample_rate_hz ? `${escapeHtml(normalization.target_sample_rate_hz)} Hz` : "—"} / ${normalization.target_channels ? `${escapeHtml(normalization.target_channels)} ch` : "—"}` : "历史产物未记录显式重采样"}${normalization.profile_lock?.source ? ` · lock=${escapeHtml(normalization.profile_lock.source)}` : ""}${normalization.profile_lock?.winning_count ? ` · ${escapeHtml(normalization.profile_lock.winning_count)}/${escapeHtml(normalization.profile_lock.observed_audio_streams || "?")} 镜采用该 profile` : ""}${normalization.before_concat === true ? " · 每镜先重采样再拼接" : ""}${normalization.audio_pts_reset_per_shot === true ? " · 每镜音频 PTS 已重建" : ""}${resampled.length ? ` · 被归一化镜头：Shot ${escapeHtml(resampled.join(", "))}` : ""}</p></div>
+        <div class="compose-path"><span>Local path</span><p>${escapeHtml(content.local_path || "—")}</p></div>
+        <div class="batch-video-dialog-actions">${url ? `<a class="mini-button preview-link-button" href="${escapeHtml(url)}" target="_blank" rel="noopener">新窗口打开</a><a class="mini-button preview-link-button" href="${escapeHtml(url)}" download>下载母版</a>` : ""}</div>
+      </div>
+    </div>
+    ${checkRows ? `<details class="compose-validation-details" ${auditReady ? "" : "open"}><summary>合成确定性校验</summary><div class="compose-check-list">${checkRows}</div></details>` : ""}
+    ${inputShotRows.length ? `<details class="compose-validation-details"><summary>逐镜输入与实际时长（${inputShotRows.length}）</summary><div class="compose-shot-audit-list">${inputShotRows.map(row => `<div class="compose-shot-audit-row"><b>Shot ${escapeHtml(row.shot_index ?? "—")}</b><span>actual ${escapeHtml(Number(row.actual_duration_seconds || 0).toFixed(3))}s</span><span>expected ${escapeHtml(Number(row.expected_duration_seconds || 0).toFixed(3))}s</span><span>Δ ${escapeHtml(Number(row.duration_delta_seconds || 0).toFixed(3))}s</span><span>${escapeHtml(row.file_name || row.source_url || "")}</span></div>`).join("")}</div></details>` : ""}
+    <details class="music-plan-details"><summary>查看合成执行 JSON</summary><pre>${escapeHtml(JSON.stringify(content, null, 2))}</pre></details>
   </div>`;
 }
 
@@ -1647,7 +2222,24 @@ function renderGuidancePanel(actions) {
   const chatButton = $("#saveGuidanceBtn");
   const regenButton = $("#regenerateStageBtn");
   const flowAdvance = $("#flowAdvanceBtn");
+  const skipMusicButton = $("#skipMusicBtn");
   const running = activeJob();
+  const artifacts = state.detail?.artifacts || [];
+  const batchArtifact = artifacts.find(item => item.kind === "batch_video");
+  const musicArtifact = artifacts.find(item => item.kind === "music");
+  const composeArtifact = artifacts.find(item => item.kind === "compose");
+  const previewApproved = (state.detail?.approvals || []).some(item => item.gate === "preview_approved" && item.status === "approved");
+  const batchReady = Boolean(batchArtifact?.status === "ready" && batchArtifact?.content?.coverage_complete !== false);
+  const musicReady = Boolean(musicArtifact?.status === "ready");
+  const composeReady = Boolean(composeArtifact?.status === "ready");
+  const canSkipMusic = Boolean(batchReady && previewApproved && !musicReady && !composeReady);
+  if (skipMusicButton) {
+    skipMusicButton.classList.toggle("hidden", !canSkipMusic);
+    skipMusicButton.disabled = Boolean(running) || !canSkipMusic;
+    skipMusicButton.title = canSkipMusic
+      ? "不调用音乐 API；保留现有镜头原生音轨，并直接开放最终合成。"
+      : "批量视频完整且 Preview 已批准后可跳过独立音乐。";
+  }
 
   if (document.activeElement !== memoryInput) memoryInput.value = state.detail?.project_memory || "";
   if (!stage) {
@@ -1827,10 +2419,11 @@ function renderApprovals(approvals) {
     const artifact = artifactsByKind[stage];
     const reviewRow = state.detail?.stage_reviews?.[stage];
     const review = reviewRow && artifact && Number(reviewRow.artifact_revision || 0) === Number(artifact.revision || 0) ? (reviewRow.review || {}) : {};
-    const blocked = ["regenerate_current", "wait_for_user"].includes(review.recommended_action);
+    const previewWaitingForHuman = stage === "preview" && review.recommended_action === "wait_for_user";
+    const blocked = review.recommended_action === "regenerate_current" || (review.recommended_action === "wait_for_user" && !previewWaitingForHuman);
     return `<div class="approval ${blocked ? "blocked" : ""}">
       <div class="approval-row"><strong>${escapeHtml(gate)}</strong><span class="pill ${current === "approved" ? "ready" : ""}">${current}</span></div>
-      ${blocked ? `<div class="artifact-meta">总管复盘建议：${escapeHtml(review.recommended_action)}。先调整/重生成，再确认更稳。</div>` : ""}
+      ${blocked ? `<div class="artifact-meta">总管复盘建议：${escapeHtml(review.recommended_action)}。先调整/重生成，再确认更稳。</div>` : (previewWaitingForHuman ? `<div class="artifact-meta">单镜已经生成，当前状态就是等待你人工审看确认。</div>` : "")}
       <div class="approval-actions">
         ${blocked ? `<button class="mini-button warn" data-force-approve="${gate}">仍然确认</button>` : `<button class="mini-button ok" data-approve="${gate}">确认</button>`}
         <button class="mini-button reject" data-reject="${gate}">退回</button>
@@ -1849,7 +2442,7 @@ function renderJobs(jobs) {
     <div class="job">
       <div class="job-row"><strong>${escapeHtml(state.meta.labels[job.stage] || job.stage)}</strong><span>${escapeHtml(job.status)}${["queued", "running"].includes(job.status) ? ` · ${Number(job.progress || 0)}%` : ""}</span></div>
       <div class="progress"><span style="width:${job.progress}%"></span></div>
-      <div class="artifact-meta">${escapeHtml(job.message)}</div>
+      <div class="artifact-meta" title="${escapeHtml(job.message || "")}">${escapeHtml(friendlyJobMessage(job.stage, job.status, job.message))}</div>
     </div>
   `).join("") || `<div class="event">当前无任务</div>`;
 }
@@ -1957,6 +2550,27 @@ async function regenerateCurrentStageFromFeedback() {
     throw error;
   } finally {
     input.disabled = false;
+  }
+}
+
+async function skipMusicAndContinue() {
+  if (!state.selectedId) return;
+  const running = activeJob();
+  if (running) {
+    toast(`已有进行中任务：${state.meta.labels[running.stage] || running.stage}`);
+    return;
+  }
+  if (!window.confirm("确认暂不生成独立 BGM？\n\nHarness 不会调用音乐 API，也不会改动已生成的视频；最终合成会直接拼接当前完整批量视频，并保留每镜 Seedance 原生对白、环境音与 Foley。以后仍可回到配乐节点补做音乐并重新合成。")) return;
+  const button = $("#skipMusicBtn");
+  if (button) button.disabled = true;
+  try {
+    const result = await api(`/api/workspaces/${state.selectedId}/music/skip`, {method: "POST"});
+    state.chatStageOverride = "compose";
+    state.tab = "flow";
+    await refreshCurrent();
+    toast(result.media_generated === false ? "已跳过独立音乐；未调用音乐 API。现在可以生成最终合成。" : "音乐跳过状态已更新");
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
@@ -2354,6 +2968,7 @@ function bindUi() {
   on("#saveGuidanceBtn", "click", () => chatStageGuidance().catch(error => toast(error.message)));
   on("#regenerateStageBtn", "click", () => regenerateCurrentStageFromFeedback().catch(error => toast(error.message)));
   on("#flowAdvanceBtn", "click", advance);
+  on("#skipMusicBtn", "click", () => skipMusicAndContinue().catch(error => toast(error.message)));
   on("#saveMemoryBtn", "click", () => saveProjectMemory(false).catch(error => toast(error.message)));
   on("#stageGuidanceInput", "keydown", event => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {

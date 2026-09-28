@@ -10,3 +10,5 @@ Requires-Dist: python-multipart<1,>=0.0.9
 Requires-Dist: python-dotenv<2,>=1
 Provides-Extra: dev
 Requires-Dist: pytest<9,>=8; extra == "dev"
+Provides-Extra: tos
+Requires-Dist: tos<3,>=2.9; extra == "tos"

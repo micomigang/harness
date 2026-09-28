@@ -1063,6 +1063,28 @@ def revalidate_sound_plan(workspace_id: str) -> dict[str, Any]:
         raise HTTPException(409, str(exc)) from exc
 
 
+@app.post("/api/workspaces/{workspace_id}/batch-video/revalidate")
+def revalidate_batch_video(workspace_id: str) -> dict[str, Any]:
+    """Re-run batch coverage/audit review without creating new video tasks."""
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    try:
+        return orchestrator.revalidate_batch_video(workspace_id)
+    except OrchestrationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/workspaces/{workspace_id}/music/skip")
+def skip_music(workspace_id: str) -> dict[str, Any]:
+    """Explicitly defer independent BGM generation and unlock local video compose."""
+    if not db.get_workspace(workspace_id):
+        raise HTTPException(404, "Workspace not found")
+    try:
+        return orchestrator.skip_music(workspace_id)
+    except OrchestrationError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
 @app.post("/api/workspaces/{workspace_id}/reference-images/reconcile-bindings")
 def reconcile_reference_image_bindings(workspace_id: str) -> dict[str, Any]:
     """Synchronize reference bindings to current selected upstream candidates.
@@ -1177,7 +1199,8 @@ def update_approval(
             review_row = db.get_stage_review(workspace_id, gate_stage)
             if artifact and review_row and int(review_row.get("artifact_revision") or 0) == int(artifact.get("revision") or 0):
                 recommended = str((review_row.get("review") or {}).get("recommended_action") or "")
-                if recommended in {"regenerate_current", "wait_for_user"} and not payload.force:
+                preview_waiting_for_human = gate_stage == "preview" and recommended == "wait_for_user"
+                if recommended in {"regenerate_current", "wait_for_user"} and not preview_waiting_for_human and not payload.force:
                     raise HTTPException(409, f"总管复盘尚未通过：{recommended}。可先调整/重生成，或明确使用强制确认覆盖总管建议。")
     result = db.set_approval(workspace_id, gate, payload.status, payload.note)
     if gate == "assets_approved" and payload.status == "approved":

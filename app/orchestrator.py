@@ -73,9 +73,9 @@ REQUIRES = {
     "review": ["storyboard", "dialogue_plan", "sound_plan"],
     "preview": ["review"],
     "batch_video": ["preview"],
-    "music_plan": ["batch_video", "script", "dialogue_plan"],
+    "music_plan": ["batch_video", "script", "storyboard", "dialogue_plan", "sound_plan"],
     "music": ["batch_video", "music_plan"],
-    "compose": ["batch_video", "music", "music_plan"],
+    "compose": ["batch_video", "music"],
     "delivery_qa": ["compose", "batch_video"],
 }
 
@@ -236,6 +236,12 @@ class Orchestrator:
                 storyboard_content=(by_kind.get("storyboard") or {}).get("content", {}),
                 dialogue_content=(by_kind.get("dialogue_plan") or {}).get("content", {}),
             )
+        elif stage == "music_plan":
+            content = self._normalize_music_plan(
+                content,
+                storyboard_content=(by_kind.get("storyboard") or {}).get("content", {}),
+                dialogue_content=(by_kind.get("dialogue_plan") or {}).get("content", {}),
+            )
         elif stage == "preview":
             try:
                 expected_shot_index = requested_preview_shot_index(
@@ -260,12 +266,23 @@ class Orchestrator:
             "acceptance_criteria": execution_directive.get("acceptance_criteria", []),
             "planner_model": execution_directive.get("planner_model", ""),
         }
+        artifact_status = "ready"
+        batch_status = str(content.get("status") or "").lower()
+        if stage == "batch_video" and (
+            batch_status in {"partial", "partial_failed", "failed"}
+            or content.get("coverage_complete") is False
+        ):
+            # Preserve partial successful clips for resume, but do not open
+            # downstream music/compose stages until the complete storyboard is
+            # covered by successful video items.
+            artifact_status = "stale"
         result = self.db.upsert_artifact(
             workspace_id,
             stage,
             STAGE_LABELS[stage],
             content,
             provider.name,
+            status=artifact_status,
             upstream=REQUIRES.get(stage, []),
         )
         if stage == "reference_images":
@@ -2159,6 +2176,92 @@ class Orchestrator:
         }
         return result
 
+    @classmethod
+    def _normalize_music_plan(
+        cls,
+        content: dict[str, Any],
+        *,
+        storyboard_content: dict[str, Any] | None = None,
+        dialogue_content: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Attach deterministic coverage facts to the model-owned BGM plan.
+
+        Shot count is always derived from the current storyboard. Harness validates
+        cue structure/ranges only; musical taste remains owned by the music model.
+        """
+        result = dict(content or {})
+        storyboard_content = storyboard_content if isinstance(storyboard_content, dict) else {}
+        dialogue_content = dialogue_content if isinstance(dialogue_content, dict) else {}
+        shots = storyboard_content.get("shots") if isinstance(storyboard_content.get("shots"), list) else []
+        expected_indices: list[int] = []
+        shot_durations: dict[int, float] = {}
+        total_duration = 0.0
+        for position, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict):
+                continue
+            match = re.search(r"\d+", str(shot.get("index", position)))
+            index = int(match.group(0)) if match else position
+            duration = float(shot.get("duration_seconds") or 0.0)
+            expected_indices.append(index)
+            shot_durations[index] = duration
+            total_duration += duration
+
+        cues = result.get("cues") if isinstance(result.get("cues"), list) else []
+        normalized_cues: list[dict[str, Any]] = []
+        covered: set[int] = set()
+        invalid_ranges: list[dict[str, Any]] = []
+        for position, raw in enumerate(cues, start=1):
+            if not isinstance(raw, dict):
+                invalid_ranges.append({"cue": position, "reason": "cue_not_object"})
+                continue
+            cue = dict(raw)
+            try:
+                start_shot = int(cue.get("start_shot"))
+                end_shot = int(cue.get("end_shot"))
+            except (TypeError, ValueError):
+                invalid_ranges.append({"cue": position, "reason": "invalid_shot_range"})
+                normalized_cues.append(cue)
+                continue
+            cue["start_shot"] = start_shot
+            cue["end_shot"] = end_shot
+            if start_shot > end_shot or (expected_indices and (start_shot not in expected_indices or end_shot not in expected_indices)):
+                invalid_ranges.append({"cue": position, "start_shot": start_shot, "end_shot": end_shot})
+            else:
+                for index in expected_indices:
+                    if start_shot <= index <= end_shot:
+                        covered.add(index)
+            normalized_cues.append(cue)
+
+        missing = [index for index in expected_indices if index not in covered]
+        dialogue_indices: list[int] = []
+        for position, item in enumerate(dialogue_content.get("items") if isinstance(dialogue_content.get("items"), list) else [], start=1):
+            if not isinstance(item, dict):
+                continue
+            match = re.search(r"\d+", str(item.get("shot_index", position)))
+            index = int(match.group(0)) if match else position
+            status = str(item.get("status") or "").casefold()
+            silent = status in {"silent", "no_dialogue", "no-dialogue"} or item.get("no_dialogue") is True
+            if not silent:
+                dialogue_indices.append(index)
+
+        required_top = [key for key in ("global_style", "cues", "ducking", "render_mode", "status") if key not in result]
+        passed = bool(cues and not missing and not invalid_ranges and not required_top) if expected_indices else bool(cues and not required_top)
+        result["cues"] = normalized_cues
+        result["music_plan_validation"] = {
+            "status": "pass" if passed else "fail",
+            "expected_shots": expected_indices,
+            "expected_shot_count": len(expected_indices),
+            "covered_shots": sorted(covered),
+            "missing_shots": missing,
+            "cue_count": len(normalized_cues),
+            "invalid_ranges": invalid_ranges,
+            "missing_top_level_fields": required_top,
+            "dialogue_shots": dialogue_indices,
+            "total_duration_seconds": round(total_duration, 3),
+            "structural_authority": "harness",
+        }
+        return result
+
     @staticmethod
     def _guard_sound_plan_review(review: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
         """Suppress sound-plan tail-shot false negatives caused by preview truncation."""
@@ -2441,6 +2544,271 @@ class Orchestrator:
         return {"artifact": result, "sound_validation": validation, "media_regenerated": False}
 
     @staticmethod
+    def _batch_video_validation(
+        artifact: dict[str, Any],
+        storyboard_artifact: dict[str, Any] | None = None,
+        sound_artifact: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Deterministically validate batch coverage without regenerating media."""
+        content = artifact.get("content") if isinstance(artifact, dict) else {}
+        content = content if isinstance(content, dict) else {}
+        items = content.get("items") if isinstance(content.get("items"), list) else []
+        storyboard_content = (storyboard_artifact or {}).get("content") if isinstance(storyboard_artifact, dict) else {}
+        storyboard_content = storyboard_content if isinstance(storyboard_content, dict) else {}
+        shots = storyboard_content.get("shots") if isinstance(storyboard_content.get("shots"), list) else []
+        expected_indices = [
+            int(shot.get("index") or position)
+            for position, shot in enumerate(shots, start=1)
+            if isinstance(shot, dict)
+        ]
+        if not expected_indices:
+            fallback_count = int(content.get("storyboard_shots") or content.get("requested") or len(items) or 0)
+            expected_indices = list(range(1, fallback_count + 1))
+
+        counts: dict[int, int] = {}
+        by_index: dict[int, dict[str, Any]] = {}
+        invalid_rows: list[int] = []
+        for position, item in enumerate(items, start=1):
+            if not isinstance(item, dict):
+                invalid_rows.append(position)
+                continue
+            try:
+                index = int(item.get("shot_index") or 0)
+            except (TypeError, ValueError):
+                index = 0
+            if index <= 0:
+                invalid_rows.append(position)
+                continue
+            counts[index] = counts.get(index, 0) + 1
+            by_index[index] = item
+        duplicates = sorted(index for index, count in counts.items() if count > 1)
+        missing = [index for index in expected_indices if index not in by_index]
+        failed = [
+            index for index in expected_indices
+            if index in by_index and str(by_index[index].get("status") or "").lower() != "succeeded"
+        ]
+        extras = sorted(index for index in by_index if index not in set(expected_indices))
+        requested = int(content.get("requested") or 0)
+        completed = int(content.get("completed") or 0)
+        expected_count = len(expected_indices)
+        successful_count = sum(
+            1 for index in expected_indices
+            if index in by_index and str(by_index[index].get("status") or "").lower() == "succeeded"
+        )
+        counter_consistent = (requested in {0, expected_count}) and completed == successful_count
+
+        sound_content = (sound_artifact or {}).get("content") if isinstance(sound_artifact, dict) else {}
+        sound_content = sound_content if isinstance(sound_content, dict) else {}
+        sound_items = sound_content.get("items") if isinstance(sound_content.get("items"), list) else []
+        sound_by_shot: dict[int, dict[str, Any]] = {}
+        for position, item in enumerate(sound_items, start=1):
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("shot_index") or position)
+            except (TypeError, ValueError):
+                continue
+            sound_by_shot[index] = item
+        sound_source_checks: dict[str, Any] = {}
+        for index in expected_indices:
+            sound = sound_by_shot.get(index)
+            if not isinstance(sound, dict):
+                continue
+            ducking = sound.get("ducking")
+            ducking_active: bool | None = None
+            if isinstance(ducking, dict):
+                if "active" in ducking:
+                    ducking_active = bool(ducking.get("active"))
+                elif "enabled" in ducking:
+                    ducking_active = bool(ducking.get("enabled"))
+            elif isinstance(ducking, bool):
+                ducking_active = ducking
+            negative = sound.get("negative_audio")
+            if isinstance(negative, list):
+                negative_count = len([value for value in negative if str(value).strip()])
+            elif negative in (None, ""):
+                negative_count = 0
+            else:
+                negative_count = 1
+            sound_source_checks[str(index)] = {
+                "ducking_active": ducking_active,
+                "negative_audio_count": negative_count,
+                "sound_plan_hydrated": True,
+            }
+
+        passed = bool(
+            expected_count
+            and len(items) == expected_count
+            and not missing
+            and not failed
+            and not duplicates
+            and not extras
+            and not invalid_rows
+            and counter_consistent
+        )
+        return {
+            "status": "pass" if passed else "fail",
+            "expected_items": expected_count,
+            "actual_items": len(items),
+            "expected_shot_indices": expected_indices,
+            "actual_shot_indices": sorted(by_index),
+            "missing_shots": missing,
+            "failed_shots": failed,
+            "duplicate_shots": duplicates,
+            "extra_shots": extras,
+            "invalid_rows": invalid_rows,
+            "requested": requested,
+            "completed": completed,
+            "successful_items": successful_count,
+            "counter_consistent": counter_consistent,
+            "coverage_complete": bool(content.get("coverage_complete")),
+            "sound_source_checks": sound_source_checks,
+        }
+
+    def revalidate_batch_video(self, workspace_id: str) -> dict[str, Any]:
+        """Re-run batch-video audit/review without creating any Seedance task."""
+        workspace = self._workspace(workspace_id)
+        if self.db.list_active_jobs(workspace_id):
+            raise OrchestrationError("工作区仍有进行中的任务，请等待结束后再重新审计批量视频")
+        current = self.db.get_artifact(workspace_id, "batch_video")
+        if not current:
+            raise OrchestrationError("当前还没有批量视频产物可重新审计")
+        storyboard = self.db.get_artifact(workspace_id, "storyboard")
+        sound = self.db.get_artifact(workspace_id, "sound_plan")
+        validation = self._batch_video_validation(current, storyboard, sound)
+        content = current.get("content") if isinstance(current.get("content"), dict) else {}
+        review_artifact = dict(current)
+        review_content = dict(content)
+        review_content["batch_validation"] = validation
+        review_artifact["content"] = review_content
+        saved = self.db.get_stage_guidance(workspace_id, "batch_video") or {}
+        directive = saved.get("director_plan") if isinstance(saved.get("director_plan"), dict) else {}
+        instruction = str(saved.get("user_instruction") or (content.get("_execution") or {}).get("user_instruction") or "")
+        self._post_generation_review(
+            provider=self.providers.workflow(), workspace=workspace, stage="batch_video", artifact=review_artifact,
+            user_instruction=instruction, project_memory=self.db.get_workspace_memory(workspace_id),
+            execution_directive=directive,
+        )
+        review_row = self.db.get_stage_review(workspace_id, "batch_video") or {}
+        review = review_row.get("review") if isinstance(review_row.get("review"), dict) else {}
+        self.db.add_event(workspace_id, "batch_video.revalidated", {
+            "revision": current.get("revision"), "status": validation.get("status"),
+            "items": validation.get("actual_items"), "expected_items": validation.get("expected_items"),
+            "media_regenerated": False,
+        })
+        return {
+            "artifact": current,
+            "batch_validation": validation,
+            "review": review,
+            "media_regenerated": False,
+        }
+
+    @staticmethod
+    def _guard_batch_video_review(review: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
+        """Keep batch review subordinate to deterministic full-coverage validation."""
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else {}
+        content = content if isinstance(content, dict) else {}
+        validation = content.get("batch_validation") if isinstance(content.get("batch_validation"), dict) else {}
+        if validation.get("status") != "pass":
+            return guarded
+
+        sound_checks = validation.get("sound_source_checks") if isinstance(validation.get("sound_source_checks"), dict) else {}
+        expected_indices = {
+            int(value)
+            for value in (validation.get("expected_shot_indices") or [])
+            if str(value).isdigit() and int(value) > 0
+        }
+
+        def mentioned_shot_indices(blob: str) -> set[int]:
+            """Extract shot numbers from reviewer prose without assuming an episode size."""
+            found: set[int] = set()
+            for match in re.finditer(r"(?:shot|镜头)\s*0*(\d+)", blob, re.IGNORECASE):
+                try:
+                    value = int(match.group(1))
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    found.add(value)
+            # Also understand ranges such as ``Shots 11–14`` / ``shots 3-6``.
+            for match in re.finditer(r"shots?\s*0*(\d+)\s*[–—-]\s*0*(\d+)", blob, re.IGNORECASE):
+                try:
+                    start, end = int(match.group(1)), int(match.group(2))
+                except (TypeError, ValueError):
+                    continue
+                if 0 < start <= end and end - start <= 500:
+                    found.update(range(start, end + 1))
+            return found
+
+        def is_false_structural(item: Any) -> bool:
+            blob = json.dumps(item, ensure_ascii=False).casefold()
+            mentioned = mentioned_shot_indices(blob)
+            missing_words = ("缺失", "missing", "完全缺失", "仅出现", "结构不一致", "补提交缺失")
+            structural_markers = (
+                "generated_artifact.content.items", "items 数组", "items列表", "items list",
+                "actual_items", "completed=", "requested=", "coverage",
+            )
+            numbered_items_claim = bool(re.search(r"\b\d+\s*(?:条\s*)?items\b", blob, re.IGNORECASE))
+            missing_claim = any(word in blob for word in missing_words)
+
+            # Once deterministic validation proves exact storyboard coverage, any
+            # reviewer claim that artifact items / requested/completed coverage is
+            # missing is structurally false regardless of whether this episode has
+            # 6, 14, 27, or any other number of shots.
+            if missing_claim and (
+                any(marker in blob for marker in structural_markers)
+                or numbered_items_claim
+                or (mentioned and (not expected_indices or mentioned.issubset(expected_indices)))
+            ):
+                return True
+
+            verification_words = ("未显式", "not explicit", "无法验证", "cannot verify")
+            if "ducking.active" in blob and any(word in blob for word in verification_words):
+                targets = mentioned or expected_indices
+                if not targets:
+                    return False
+                return all(
+                    isinstance(sound_checks.get(str(index)), dict)
+                    and sound_checks[str(index)].get("ducking_active") is not None
+                    for index in targets
+                )
+
+            if "negative_audio" in blob and any(word in blob for word in (*verification_words, "缺失", "missing")):
+                targets = mentioned or expected_indices
+                if not targets:
+                    return False
+                return all(
+                    isinstance(sound_checks.get(str(index)), dict)
+                    and int(sound_checks[str(index)].get("negative_audio_count") or 0) > 0
+                    for index in targets
+                )
+            return False
+
+        deviations = guarded.get("deviations") if isinstance(guarded.get("deviations"), list) else []
+        suggestions = guarded.get("suggested_adjustments") if isinstance(guarded.get("suggested_adjustments"), list) else []
+        suppressed = [item for item in deviations if is_false_structural(item)]
+        kept = [item for item in deviations if not is_false_structural(item)]
+        guarded["deviations"] = kept
+        guarded["suggested_adjustments"] = [item for item in suggestions if not is_false_structural(item)]
+        if not kept:
+            guarded["assessment"] = "pass"
+            guarded["recommended_action"] = "proceed"
+            guarded["reply"] = (
+                f"批量视频已通过 Harness 确定性复验：{validation.get('actual_items')}/{validation.get('expected_items')} 镜均存在且 succeeded，"
+                "requested/completed 计数一致。未重新生成任何视频；可进入下游配乐阶段。"
+            )
+        guarded["harness_review_guard"] = {
+            "batch_validation_status": validation.get("status"),
+            "structural_authority": "artifact.content.items + storyboard",
+            "expected_items": validation.get("expected_items"),
+            "actual_items": validation.get("actual_items"),
+            "suppressed_false_deviations": suppressed,
+            "remaining_deviations": kept,
+            "sound_source_checks": sound_checks,
+        }
+        return guarded
+
+    @staticmethod
     def _guard_asset_manifest_review(
         review: dict[str, Any],
         artifact: dict[str, Any],
@@ -2644,6 +3012,72 @@ class Orchestrator:
         }
         return guarded
 
+    @staticmethod
+    def _guard_compose_review(review: dict[str, Any], artifact: dict[str, Any]) -> dict[str, Any]:
+        """Keep compose review subordinate to deterministic FFmpeg/ffprobe audit.
+
+        The external reviewer intentionally does not receive the literal local filesystem
+        path. Once Harness has recorded file presence, exact storyboard coverage, FFmpeg
+        exit status and ffprobe output in compose_validation, those structural facts are
+        authoritative and must not cause a paid/local re-run.
+        """
+        guarded = dict(review or {})
+        content = artifact.get("content") if isinstance(artifact, dict) else {}
+        content = content if isinstance(content, dict) else {}
+        validation = content.get("compose_validation") if isinstance(content.get("compose_validation"), dict) else {}
+        if str(validation.get("status") or "").lower() != "pass":
+            return guarded
+
+        structural_markers = (
+            "local_path", "local path", "input_shots", "input shots",
+            "input_shot", "input_shot_indices", "expected_shot_indices",
+            "encoding", "h.264", "720p", "9:16", "720x1280", "1080x1920", "分辨率", "resolution",
+            "duration_seconds", "成片时长", "duration", "ffmpeg", "ffprobe",
+            "sample_rate", "采样率", "32 khz", "32khz", "stereo",
+            "重采样", "resampl", "stream", "codec", "aac",
+        )
+        missing_words = (
+            "缺", "missing", "未记录", "未显式", "无法验证", "未通过",
+            "不匹配", "不符合", "错误", "偏差", "非 1080", "仅展示",
+            "cannot verify", "not recorded", "not exposed", "incomplete",
+            "mismatch", "incorrect", "wrong", "only shows",
+        )
+
+        def false_structural(item: Any) -> bool:
+            blob = json.dumps(item, ensure_ascii=False).casefold()
+            return any(marker.casefold() in blob for marker in structural_markers) and any(
+                word.casefold() in blob for word in missing_words
+            )
+
+        raw_deviations = guarded.get("deviations")
+        deviations = raw_deviations if isinstance(raw_deviations, list) else ([raw_deviations] if raw_deviations not in (None, "") else [])
+        raw_suggestions = guarded.get("suggested_adjustments")
+        suggestions = raw_suggestions if isinstance(raw_suggestions, list) else ([raw_suggestions] if raw_suggestions not in (None, "") else [])
+        suppressed = [item for item in deviations if false_structural(item)]
+        kept = [item for item in deviations if not false_structural(item)]
+        guarded["deviations"] = kept
+        guarded["suggested_adjustments"] = [item for item in suggestions if not false_structural(item)]
+        if not kept:
+            guarded["assessment"] = "pass"
+            guarded["recommended_action"] = "proceed"
+            audio_lock = content.get("audio_profile_lock") if isinstance(content.get("audio_profile_lock"), dict) else {}
+            rate = int(audio_lock.get("sample_rate_hz") or 0)
+            channels = int(audio_lock.get("channels") or 0)
+            profile_label = f"{rate} Hz / {channels} ch" if rate and channels else "当前锁定音频 profile"
+            guarded["reply"] = (
+                "最终合成已通过 Harness 确定性校验：镜头顺序与当前 storyboard 完全一致，"
+                "FFmpeg 返回码为 0，母版可由 ffprobe 正常读取，视频/音频编码、"
+                f"{profile_label} 归一化及动态目标时长均已核实。可进入交付质检。"
+            )
+        guarded["harness_review_guard"] = {
+            "compose_validation_status": validation.get("status"),
+            "structural_authority": validation.get("structural_authority") or "harness+ffmpeg+ffprobe",
+            "suppressed_false_deviations": suppressed,
+            "remaining_deviations": kept,
+            "validation": validation,
+        }
+        return guarded
+
     def _post_generation_review(
         self,
         *,
@@ -2690,6 +3124,10 @@ class Orchestrator:
             review = self._guard_sound_plan_review(review, artifact)
         elif stage == "preview" and review:
             review = self._guard_preview_review(review, artifact)
+        elif stage == "batch_video" and review:
+            review = self._guard_batch_video_review(review, artifact)
+        elif stage == "compose" and review:
+            review = self._guard_compose_review(review, artifact)
         reply = str(review.get("reply") or "").strip()
         if not reply:
             next_actions = context["next_actions"]
@@ -3726,11 +4164,146 @@ class Orchestrator:
         ordered = [stage for stage in STAGES if stage in downstream]
         return self.db.mark_artifacts_stale(workspace_id, ordered)
 
+    def skip_music(self, workspace_id: str) -> dict[str, Any]:
+        """Explicitly skip independent BGM generation and open the compose stage.
+
+        This is a user-controlled production shortcut, not a fallback that may fire
+        automatically. Existing Seedance dialogue/ambience/foley audio is preserved
+        byte-for-byte at the shot level; no music API is called and no new media is
+        generated. A future music-plan or music revision will invalidate compose via
+        the normal dependency graph.
+        """
+        workspace = self._workspace(workspace_id)
+        if self.db.list_active_jobs(workspace_id):
+            raise OrchestrationError("工作区仍有进行中的任务，请等待结束后再跳过音乐")
+        if not self._is_approved(workspace_id, "preview_approved"):
+            raise OrchestrationError("请先批准单镜预览，再决定是否跳过音乐")
+
+        batch = self.db.get_artifact(workspace_id, "batch_video")
+        storyboard = self.db.get_artifact(workspace_id, "storyboard")
+        sound = self.db.get_artifact(workspace_id, "sound_plan")
+        if not batch or str(batch.get("status") or "") != "ready":
+            raise OrchestrationError("批量视频尚未完整 ready，不能直接进入最终合成")
+        validation = self._batch_video_validation(batch, storyboard, sound)
+        # Skip is allowed for legacy complete batches even when older artifacts
+        # did not persist requested/completed/coverage_complete counters. The
+        # actual shot rows remain authoritative: every current storyboard shot
+        # must exist exactly once and have succeeded.
+        structural_coverage_ok = bool(
+            int(validation.get("expected_items") or 0) > 0
+            and int(validation.get("actual_items") or 0) == int(validation.get("expected_items") or 0)
+            and not validation.get("missing_shots")
+            and not validation.get("failed_shots")
+            and not validation.get("duplicate_shots")
+            and not validation.get("extra_shots")
+            and not validation.get("invalid_rows")
+        )
+        if not structural_coverage_ok:
+            raise OrchestrationError(
+                "批量视频覆盖尚未通过，不能跳过音乐："
+                + json.dumps(validation, ensure_ascii=False)
+            )
+
+        # Re-apply the deterministic batch-review guard locally before opening
+        # compose. This does not call Kimi and does not generate media. It only
+        # suppresses reviewer claims that are provably false from full shot
+        # coverage / hydrated sound-plan evidence. Genuine remaining review
+        # deviations still block the skip path.
+        review_row = self.db.get_stage_review(workspace_id, "batch_video") or {}
+        if int(review_row.get("artifact_revision") or 0) == int(batch.get("revision") or 0):
+            current_review = review_row.get("review") if isinstance(review_row.get("review"), dict) else {}
+            review_artifact = dict(batch)
+            review_content = dict(batch.get("content") or {})
+            review_content["batch_validation"] = validation
+            review_artifact["content"] = review_content
+            guarded_review = self._guard_batch_video_review(current_review, review_artifact)
+            if guarded_review != current_review:
+                self.db.set_stage_review(
+                    workspace_id, "batch_video", int(batch.get("revision") or 0), guarded_review
+                )
+            if str(guarded_review.get("recommended_action") or "") in {"regenerate_current", "wait_for_user"}:
+                raise OrchestrationError(
+                    "批量视频总管复盘仍有非结构性阻塞，请先处理该问题后再跳过音乐"
+                )
+
+        # Any existing compose/delivery result was based on an older music decision.
+        invalidated = self.invalidate_downstream(workspace_id, "music")
+        self.db.clear_stage_reviews(workspace_id, ["music", *invalidated])
+
+        music_plan = self.db.get_artifact(workspace_id, "music_plan")
+        plan_ready = bool(music_plan and str(music_plan.get("status") or "") == "ready")
+        agent = agent_for_stage("music")
+        content = {
+            "mode": "skipped_no_bgm",
+            "status": "ready",
+            "skipped": True,
+            "skip_reason": "user_deferred_music_generation",
+            "source_audio": "seedance_native_audio",
+            "compose_behavior": "preserve_existing_shot_audio_without_bgm_mix",
+            "note": "用户明确选择暂不生成独立 BGM；最终合成仅拼接现有 Seedance 镜头，并保留镜头自带对白、环境音与 Foley。",
+            "batch_video_revision": int(batch.get("revision") or 0),
+            "batch_validation": {
+                "status": "pass" if structural_coverage_ok else validation.get("status"),
+                "deterministic_status": validation.get("status"),
+                "expected_items": validation.get("expected_items"),
+                "actual_items": validation.get("actual_items"),
+                "expected_shot_indices": validation.get("expected_shot_indices", []),
+            },
+            "music_plan_revision": int(music_plan.get("revision") or 0) if plan_ready else None,
+            "plan": (music_plan.get("content") or {}) if plan_ready else {},
+            "_agent": {"id": agent.id, "name": agent.name},
+            "_execution": {
+                "interaction_mode": "skip_music",
+                "user_explicit": True,
+                "music_api_called": False,
+                "media_generated": False,
+            },
+        }
+        result = self.db.upsert_artifact(
+            workspace_id,
+            "music",
+            STAGE_LABELS["music"],
+            content,
+            "local-skip",
+            status="ready",
+            upstream=["batch_video"] + (["music_plan"] if plan_ready else []),
+        )
+        self.db.update_workspace(workspace_id, stage="music", status="active")
+        self.db.add_event(
+            workspace_id,
+            "music.skipped",
+            {
+                "music_revision": result.get("revision"),
+                "batch_video_revision": int(batch.get("revision") or 0),
+                "music_plan_revision": int(music_plan.get("revision") or 0) if plan_ready else None,
+                "media_generated": False,
+                "invalidated": invalidated,
+            },
+        )
+        return {
+            "artifact": result,
+            "batch_validation": validation,
+            "invalidated": invalidated,
+            "next_stage": "compose",
+            "media_generated": False,
+        }
+
     def next_actions(self, workspace_id: str) -> list[dict[str, Any]]:
         artifacts = {item["kind"]: item for item in self.db.list_artifacts(workspace_id)}
         approvals = {item["gate"]: item["status"] for item in self.db.list_approvals(workspace_id)}
+        music_artifact = artifacts.get("music") or {}
+        music_content = music_artifact.get("content") if isinstance(music_artifact.get("content"), dict) else {}
+        music_explicitly_skipped = bool(
+            music_artifact.get("status") == "ready"
+            and music_content.get("skipped") is True
+            and str(music_content.get("mode") or "") == "skipped_no_bgm"
+        )
         actions: list[dict[str, Any]] = []
         for stage in STAGES[1:]:
+            if stage == "music_plan" and music_explicitly_skipped:
+                # The user explicitly deferred the optional music branch. Do not
+                # force a failed/missing cue-sheet stage to block local video concat.
+                continue
             artifact = artifacts.get(stage)
             if artifact and artifact["status"] == "ready":
                 gate = GATES.get(stage)
