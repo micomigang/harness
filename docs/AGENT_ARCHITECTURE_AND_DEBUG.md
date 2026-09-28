@@ -148,7 +148,7 @@ Invoke-RestMethod http://127.0.0.1:8788/api/meta | ConvertTo-Json -Depth 8
 6. `storyboard / dialogue_plan / sound_plan / review`：只调用 Kimi；确认 `blocking_failures=[]` 后审批 `storyboard_approved`。
 7. `preview`：首次产生 Seedance 视频费用，只生成一个镜头。人工查看法语发音、口型、角色身份、衣着、画幅和费用，再审批 `preview_approved`。
 8. `batch_video`：逐镜提交，首个失败即停。确认 `requested`、`completed` 和本地文件数一致。
-9. `music_plan / music`：生成方案；当前没有独立音乐 API 时，`music.mode` 必须明确为 `seedance_native_audio_without_separate_bgm`。
+9. `music_plan / music`：生成方案；当前没有独立音乐 API 时，`music.mode` 必须明确为 `shot_native_audio_without_separate_bgm`。
 10. `compose`：本地 FFmpeg 拼接；不产生模型费用。
 11. `delivery_qa`：本地 FFprobe 检查；不产生模型费用。
 

@@ -4,6 +4,7 @@ from app.config import settings
 from app.tos_archive import TosArchive
 
 from .base import WorkflowProvider
+from .comfy_h3 import ComfyH3Provider
 from .hybrid import RoutedProvider
 from .local_media import LocalMediaProvider
 from .mock import MockProvider
@@ -42,6 +43,8 @@ class ProviderRegistry:
                 read_timeout_seconds=settings.openai_read_timeout_seconds,
             )
         if settings.provider in {"kimi-seedance", "hybrid"}:
+            if settings.video_backend not in {"seedance", "comfyui-h3"}:
+                raise ValueError(f"Unsupported VIDEO_BACKEND: {settings.video_backend}")
             if settings.tos_bucket and (
                 not settings.ark_account_id or settings.tos_account_id != settings.ark_account_id
             ):
@@ -87,23 +90,36 @@ class ProviderRegistry:
                     account_id=settings.ark_account_id,
                     original_archive=original_archive,
                 ),
-                video=SeedanceProvider(
-                    api_key=settings.video_api_key,
-                    base_url=settings.video_base_url,
-                    model=settings.video_model,
-                    fallback_model=settings.video_fallback_model,
-                    resolution=settings.video_resolution,
-                    ratio=settings.video_ratio,
-                    generate_audio=settings.video_generate_audio,
-                    poll_interval_seconds=settings.video_poll_interval_seconds,
-                    poll_timeout_seconds=settings.video_poll_timeout_seconds,
-                    batch_max_shots=settings.video_batch_max_shots,
-                    batch_concurrency=settings.video_batch_concurrency,
-                    output_dir=settings.data_dir / "outputs",
-                    account_id=settings.ark_account_id,
-                    original_archive=original_archive,
-                    preflight_enabled=True,
-                    ffmpeg_path=settings.ffmpeg_path,
+                video=(
+                    ComfyH3Provider(
+                        base_url=settings.h3_comfy_url,
+                        models_dir=settings.h3_models_dir,
+                        output_dir=settings.data_dir / "outputs",
+                        resolution=settings.h3_resolution,
+                        ratio=settings.video_ratio,
+                        generate_audio=settings.video_generate_audio,
+                        timeout_seconds=settings.h3_timeout_seconds,
+                        ffmpeg_path=settings.ffmpeg_path,
+                    )
+                    if settings.video_backend == "comfyui-h3" else
+                    SeedanceProvider(
+                        api_key=settings.video_api_key,
+                        base_url=settings.video_base_url,
+                        model=settings.video_model,
+                        fallback_model=settings.video_fallback_model,
+                        resolution=settings.video_resolution,
+                        ratio=settings.video_ratio,
+                        generate_audio=settings.video_generate_audio,
+                        poll_interval_seconds=settings.video_poll_interval_seconds,
+                        poll_timeout_seconds=settings.video_poll_timeout_seconds,
+                        batch_max_shots=settings.video_batch_max_shots,
+                        batch_concurrency=settings.video_batch_concurrency,
+                        output_dir=settings.data_dir / "outputs",
+                        account_id=settings.ark_account_id,
+                        original_archive=original_archive,
+                        preflight_enabled=True,
+                        ffmpeg_path=settings.ffmpeg_path,
+                    )
                 ),
                 media=LocalMediaProvider(
                     ffmpeg_path=settings.ffmpeg_path,

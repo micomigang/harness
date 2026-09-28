@@ -35,7 +35,9 @@ def test_full_mock_pipeline(tmp_path: Path):
     orchestrator.run(workspace_id, "sound_plan")
     orchestrator.run(workspace_id, "review")
     db.set_approval(workspace_id, "storyboard_approved", "approved")
+    db.set_approval(workspace_id, "preview_approved", "approved", "older preview")
     orchestrator.run(workspace_id, "preview")
+    assert next(item for item in db.list_approvals(workspace_id) if item["gate"] == "preview_approved")["status"] == "pending"
     db.set_approval(workspace_id, "preview_approved", "approved")
     for stage in ["batch_video", "music_plan", "music", "compose", "delivery_qa"]:
         orchestrator.run(workspace_id, stage)

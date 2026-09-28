@@ -285,6 +285,11 @@ class Orchestrator:
             status=artifact_status,
             upstream=REQUIRES.get(stage, []),
         )
+        if stage == "preview":
+            self.db.set_approval(
+                workspace_id, "preview_approved", "pending",
+                "单镜预览已更新，请审阅当前产物后重新确认",
+            )
         if stage == "reference_images":
             self._sync_reference_image_candidates(workspace_id, result)
         self.db.update_workspace(workspace_id, stage=stage, status="active")
@@ -4168,7 +4173,7 @@ class Orchestrator:
         """Explicitly skip independent BGM generation and open the compose stage.
 
         This is a user-controlled production shortcut, not a fallback that may fire
-        automatically. Existing Seedance dialogue/ambience/foley audio is preserved
+        automatically. Existing shot dialogue/ambience/foley audio is preserved
         byte-for-byte at the shot level; no music API is called and no new media is
         generated. A future music-plan or music revision will invalidate compose via
         the normal dependency graph.
@@ -4238,9 +4243,9 @@ class Orchestrator:
             "status": "ready",
             "skipped": True,
             "skip_reason": "user_deferred_music_generation",
-            "source_audio": "seedance_native_audio",
+            "source_audio": "shot_native_audio",
             "compose_behavior": "preserve_existing_shot_audio_without_bgm_mix",
-            "note": "用户明确选择暂不生成独立 BGM；最终合成仅拼接现有 Seedance 镜头，并保留镜头自带对白、环境音与 Foley。",
+            "note": "用户明确选择暂不生成独立 BGM；最终合成仅拼接现有镜头，并保留镜头自带对白、环境音与 Foley。",
             "batch_video_revision": int(batch.get("revision") or 0),
             "batch_validation": {
                 "status": "pass" if structural_coverage_ok else validation.get("status"),

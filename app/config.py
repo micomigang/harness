@@ -47,6 +47,7 @@ class Settings:
     tos_bucket: str
     tos_account_id: str
     video_api_key: str
+    video_backend: str
     video_base_url: str
     video_model: str
     video_fallback_model: str
@@ -57,6 +58,10 @@ class Settings:
     video_poll_timeout_seconds: int
     video_batch_max_shots: int
     video_batch_concurrency: int
+    h3_comfy_url: str
+    h3_models_dir: Path
+    h3_resolution: str
+    h3_timeout_seconds: int
     ffmpeg_path: str
     tts_app_id: str
     tts_access_token: str
@@ -118,6 +123,7 @@ class Settings:
             tos_bucket=os.getenv("TOS_BUCKET", "").strip(),
             tos_account_id=os.getenv("TOS_ACCOUNT_ID", "").strip(),
             video_api_key=os.getenv("VIDEO_API_KEY", ""),
+            video_backend=os.getenv("VIDEO_BACKEND", "seedance").strip().lower(),
             video_base_url=os.getenv(
                 "VIDEO_API_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
             ).rstrip("/"),
@@ -137,6 +143,10 @@ class Settings:
             ),
             video_batch_max_shots=int(os.getenv("VIDEO_BATCH_MAX_SHOTS", "8")),
             video_batch_concurrency=int(os.getenv("VIDEO_BATCH_CONCURRENCY", "3")),
+            h3_comfy_url=os.getenv("H3_COMFY_URL", "http://127.0.0.1:8188").rstrip("/"),
+            h3_models_dir=Path(os.getenv("H3_MODELS_DIR") or (Path.home() / "Documents" / "Codex" / "ComfyUI" / "models")),
+            h3_resolution=os.getenv("H3_RESOLUTION", "384p"),
+            h3_timeout_seconds=int(os.getenv("H3_TIMEOUT_SECONDS", "3600")),
             ffmpeg_path=os.getenv("FFMPEG_PATH", "ffmpeg"),
             tts_app_id=os.getenv("TTS_APP_ID", ""),
             tts_access_token=os.getenv("TTS_ACCESS_TOKEN", ""),

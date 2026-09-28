@@ -15,7 +15,7 @@ class LocalMediaError(RuntimeError):
 
 
 class LocalMediaProvider(WorkflowProvider):
-    """Use Seedance native audio and concatenate successful shots with FFmpeg."""
+    """Preserve shot audio and concatenate successful videos with FFmpeg."""
 
     name = "local-ffmpeg"
 
@@ -35,10 +35,10 @@ class LocalMediaProvider(WorkflowProvider):
                 {},
             )
             return {
-                "mode": "seedance_native_audio_without_separate_bgm",
+                "mode": "shot_native_audio_without_separate_bgm",
                 "status": "ready",
                 "plan": plan,
-                "note": "当前沿用 Seedance 镜头原生对白与环境音；已生成全片 BGM 方案，但未配置独立音乐生成 API，因此不会声称已渲染独立 BGM。",
+                "note": "当前沿用镜头自带的对白与环境音；已生成全片 BGM 方案，但未配置独立音乐生成 API，因此不会声称已渲染独立 BGM。",
             }
         if stage == "compose":
             return self._compose(context)
@@ -246,7 +246,7 @@ class LocalMediaProvider(WorkflowProvider):
         paths = [Path(str(item["local_path"])) for item in successful_items]
         source_files_present = bool(paths) and all(path.is_file() and path.stat().st_size > 0 for path in paths)
         if not source_files_present:
-            raise LocalMediaError("No complete local Seedance shot files available for compose")
+            raise LocalMediaError("No complete local shot files available for compose")
 
         input_audio_probe: list[dict[str, Any]] = []
         input_shot_rows: list[dict[str, Any]] = []

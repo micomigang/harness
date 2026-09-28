@@ -20,6 +20,8 @@ class RoutedProvider(WorkflowProvider):
         self.image = image
         self.video = video
         self.media = media
+        if video.name != "seedance":
+            self.name = f"kimi-{video.name}"
 
     def generate(self, stage: str, context: dict[str, Any]) -> dict[str, Any]:
         if stage in {

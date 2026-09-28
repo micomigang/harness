@@ -158,7 +158,14 @@ def health() -> dict[str, Any]:
         "seedream_reference_images": bool(
             settings.image_api_key and settings.image_model
         ),
-        "seedance_video": bool(settings.video_api_key and settings.video_model),
+        "seedance_video": bool(
+            settings.video_backend == "seedance"
+            and settings.video_api_key and settings.video_model
+        ),
+        "local_h3_video": bool(
+            settings.video_backend == "comfyui-h3"
+            and (settings.h3_models_dir / "diffusion_models" / "minimax_h3_ref2va_pruned_int8_convrot.safetensors").is_file()
+        ),
         "ffmpeg_compose": Path(settings.ffmpeg_path).is_file(),
         "french_tts": bool(
             settings.tts_app_id
@@ -173,6 +180,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "provider": settings.provider,
+        "video_backend": settings.video_backend,
         "data_dir": str(settings.data_dir),
         "stages": STAGES,
         "capabilities": capabilities,

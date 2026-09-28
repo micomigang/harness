@@ -1,13 +1,13 @@
 # 爆款复制 Harness
 
-这是一个部署在 F 盘的本地 AI 短片复制工作流。它复现目标工作区的核心行为：17 个结构化阶段、15 个有明确边界的 Agent、二次确认、级联修改、角色/场景/道具参考图、单镜预览、批量视频、最终成片和交付质检。
+这是一个本地 AI 短片复制工作流。它复现目标工作区的核心行为：17 个结构化阶段、15 个有明确边界的 Agent、二次确认、级联修改、角色/场景/道具参考图、单镜预览、批量视频、最终成片和交付质检。
 
 它不是 OiiOii 私有后端的复制品，也不会读取或复用 OiiOii 的登录凭据、积分或私有 RPC。默认 `mock` provider 能在没有 API Key 的情况下完整演示工作流。
 
 ## 快速启动（Windows PowerShell）
 
 ```powershell
-Set-Location F:\oiioii-harness
+Set-Location C:\path\to\harness
 .\run.ps1
 ```
 
@@ -72,11 +72,22 @@ $env:VIDEO_API_KEY = '<your ARK_API_KEY>'
 $env:VIDEO_API_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
 $env:VIDEO_MODEL = 'doubao-seedance-2-5-260628'
 $env:VIDEO_FALLBACK_MODEL = 'doubao-seedance-2-0-260128'
-$env:FFMPEG_PATH = 'F:\oiioii-harness\tools\ffmpeg-release\<build>\bin\ffmpeg.exe'
+$env:FFMPEG_PATH = 'C:\path\to\ffmpeg.exe'
 .\run.ps1
 ```
 
 Kimi 负责分析、剧本、三类资产、分镜、对白/口型、逐镜音效、连续性 QA 和全片配乐方案；Seedream 5.0 Pro 生成角色、场景和道具参考图；Seedance 2.5 负责法语对白、音画同出的单镜预览与批量镜头；本地 FFmpeg 统一编码并拼接最终成片，FFprobe 做交付质检。所有远端媒体会立即下载到 `data/outputs/`，再通过 `/media/` 预览。
+
+### 本地 MiniMax H3 视频后端
+
+如已具备本地运行 H3 的许可并安装了带 MiniMax H3 节点的 ComfyUI，可在 `.env` 中设置 `VIDEO_BACKEND=comfyui-h3`、`H3_COMFY_URL=http://127.0.0.1:8188`、`H3_MODELS_DIR=<ComfyUI models 目录>`、`H3_RESOLUTION=384p`。先启动 ComfyUI：
+
+```powershell
+Set-Location C:\path\to\ComfyUI
+.\.venv\Scripts\python.exe main.py --listen 127.0.0.1 --port 8188 --lowvram --disable-auto-launch
+```
+
+然后启动 Harness。H3 Ref2VA 使用当前镜头已选中的本地参考图，生成带音轨的 MP4；单镜预览和批量视频继续遵守镜头身份、五字段产物契约及人工审批门控。切换后须重新生成并审批 H3 单镜预览，已有 Seedance 视频不会作为 H3 批量结果复用。ComfyUI 模型目录需包含 Ref2VA、Qwen3VL 文本编码器、视频及音频 VAE、Ref2V Turbo LoRA。`H3_RESOLUTION` 是输出短边像素值；显存不足时可先设为 `256p`。FFmpeg 路径须指向本机可用的 `ffmpeg.exe`，同目录应有 `ffprobe.exe`。
 
 素材分析现在使用“本地高密度取证 + 30 秒分段并行分析”：默认先按 `SOURCE_BASE_FPS=1.0` 每秒至少抽取 1 张基础帧，再用 FFmpeg scene score 补充镜头切换帧；随后按 `SOURCE_SEGMENT_SECONDS=30` 切成逻辑时间段，每段最多选择 `SOURCE_SEGMENT_MAX_FRAMES=12` 张代表帧，以 Base64 `image_url` 发送给 Kimi K2.6。默认最多 `SOURCE_SEGMENT_PARALLELISM=4` 个片段并行，所有片段完成后再用一次纯文本请求汇总为全局素材分析，因此不会再把数百张图片塞进一个请求。
 
@@ -88,9 +99,9 @@ Kimi 请求现在默认使用 `OPENAI_COMPAT_READ_TIMEOUT_SECONDS=900` 的读取
 
 另外，Harness 现在对“推进下一步 / 运行阶段”增加了工作区级安全阀：同一工作区如果已有 `queued` / `running` 任务，则不会再次创建新任务。重复点击同一阶段时会直接复用现有任务；若别的阶段任务仍在运行，则新阶段会被阻止，避免重复问询、重复扣费和并发串线。
 
-当前音乐阶段会产出完整 BGM 方案，但渲染默认沿用 Seedance 的镜头原生音轨，并明确标记“未生成独立 BGM”。法语 TTS 是可选增强项，需要火山语音服务的 `TTS_APP_ID`、`TTS_ACCESS_TOKEN` 和 `TTS_VOICE_TYPE`；方舟 ARK Key 不能替代这三项。
+当前音乐阶段会产出完整 BGM 方案，但渲染默认沿用各镜头自带的音轨，并明确标记“未生成独立 BGM”。法语 TTS 是可选增强项，需要火山语音服务的 `TTS_APP_ID`、`TTS_ACCESS_TOKEN` 和 `TTS_VOICE_TYPE`；方舟 ARK Key 不能替代这三项。
 
-为控制成本，批量生成会在首个失败镜头后停止，且默认最多提交 8 个镜头。测试使用 HTTP mock，不会产生火山方舟费用。
+批量生成默认覆盖完整分镜；本地 H3 按镜头顺序执行，首个失败镜头后停止。测试使用 HTTP mock，不会产生火山方舟费用。
 
 ## 验证
 
